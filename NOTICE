@@ -1,0 +1,3 @@
+CPA Phoenix is an independent plugin. Its dynamic Codex quota-window
+eligibility and one-shot dispatch safeguards are adapted from the MIT-licensed
+codex-token-usage project by zhumengling and contributors.

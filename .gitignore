@@ -1,0 +1,7 @@
+*.so
+*.dylib
+*.h
+*.zip
+*.sha256
+*.db
+.DS_Store
