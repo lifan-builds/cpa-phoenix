@@ -190,13 +190,6 @@ func TestDashboardReviveNavigationFailureKeepsRecoveryPolling(t *testing.T) {
 	}
 }
 
-func TestDashboardOAuthValidationPreservesNativeBytes(t *testing.T) {
-	dashboard := string(dashboardPageHTML())
-	if !strings.Contains(dashboard, "return decoded") || strings.Contains(dashboard, "return parsed.toString()") {
-		t.Fatal("browser OAuth validation must preserve native URL bytes")
-	}
-}
-
 func TestDashboardOAuthValidationExecutableEntityBoundary(t *testing.T) {
 	dashboard := string(dashboardPageHTML())
 	start := strings.Index(dashboard, "function phoenixValidatedOAuthURL")
@@ -209,6 +202,7 @@ func TestDashboardOAuthValidationExecutableEntityBoundary(t *testing.T) {
 const values=[
   'https://login.test/a?client_id=x&code_challenge=abc%2Bxyz&redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fcallback&state=s&login_hint=fixture%40example.test&prompt=login&x=%2F',
   'https://login.test/a?client_id=x&amp;code_challenge=abc%2Bxyz&amp;redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fcallback&amp;state=s&amp;login_hint=fixture%40example.test&amp;prompt=login&amp;x=%2F',
+  'https://LOGIN.TEST:443/a/../authorize?client_id=x&state=s&x=%2F',
   'https://login.test/a?client_id=x&amp;amp;state=s',
   'https://login.test/a?client_id=x&amp;amp;state',
   'http://login.test/a?state=s',
@@ -225,7 +219,8 @@ console.log(JSON.stringify(values.map(phoenixValidatedOAuthURL)));`
 		t.Fatal(err)
 	}
 	want := "https://login.test/a?client_id=x&code_challenge=abc%2Bxyz&redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fcallback&state=s&login_hint=fixture%40example.test&prompt=login&x=%2F"
-	if got[0] != want || got[1] != want || got[2] != "" || got[3] != "" || got[4] != "" || got[5] != "" || got[6] != "" {
+	preserved := "https://LOGIN.TEST:443/a/../authorize?client_id=x&state=s&x=%2F"
+	if got[0] != want || got[1] != want || got[2] != preserved || got[3] != "" || got[4] != "" || got[5] != "" || got[6] != "" || got[7] != "" {
 		t.Fatalf("unexpected executable validation results: %#v", got)
 	}
 	if strings.Count(got[1], "login_hint=") != 1 || strings.Count(got[1], "prompt=") != 1 || strings.Contains(got[1], "amp;") {

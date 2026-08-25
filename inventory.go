@@ -324,16 +324,25 @@ func credentialFromRaw(raw json.RawMessage) (token, accountID string) {
 	return token, accountID
 }
 
+// hostCredential keeps the host lookup and ephemeral credential decoding in
+// one inventory-owned path. Callers may use the returned token only for the
+// bounded operation they are about to perform; neither the raw wrapper nor
+// the token is retained in durable account projections.
+func hostCredential(a account) (token, accountID string, ok bool) {
+	raw, err := hostCall("host.auth.get", map[string]string{"auth_index": a.AuthIndex})
+	if err != nil {
+		return "", "", false
+	}
+	token, accountID = credentialFromRaw(raw)
+	return token, accountID, token != ""
+}
+
 func credentialAvailable(a account) bool {
 	if strings.TrimSpace(a.AccessTokenValue) != "" {
 		return true
 	}
-	raw, err := hostCall("host.auth.get", map[string]string{"auth_index": a.AuthIndex})
-	if err != nil {
-		return false
-	}
-	token, _ := credentialFromRaw(raw)
-	return token != ""
+	_, _, ok := hostCredential(a)
+	return ok
 }
 
 func refreshCredential(a account) account {
@@ -341,12 +350,8 @@ func refreshCredential(a account) account {
 		a.AccessToken = true
 		return a
 	}
-	raw, err := hostCall("host.auth.get", map[string]string{"auth_index": a.AuthIndex})
-	if err != nil {
-		return a
-	}
-	token, accountID := credentialFromRaw(raw)
-	if token != "" {
+	token, accountID, ok := hostCredential(a)
+	if ok {
 		a.AccessTokenValue, a.AccessToken = token, true
 	}
 	if a.AccountID == "" {
@@ -414,12 +419,8 @@ func refreshQuota(a account) account {
 	// Status belongs only to this probe; a transport failure must not reuse a
 	// previous response from the same in-memory account value.
 	a.QuotaStatusCode = 0
-	raw, err := hostCall("host.auth.get", map[string]string{"auth_index": a.AuthIndex})
-	if err != nil {
-		return a
-	}
-	token, accountID := credentialFromRaw(raw)
-	if token == "" {
+	token, accountID, ok := hostCredential(a)
+	if !ok {
 		return a
 	}
 	if a.AccountID == "" {
