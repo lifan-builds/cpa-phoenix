@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -44,6 +45,17 @@ func TestComposeOAuthURLPrefillEscapesPlusEmail(t *testing.T) {
 	}
 	if strings.Contains(got, "amp;") || !strings.Contains(got, "code_challenge=a%2Bb&state=s") {
 		t.Fatalf("native query bytes were not preserved: %q", got)
+	}
+}
+
+func TestComposeOAuthURLSelectsAccountForDuplicateEmailSeats(t *testing.T) {
+	raw := "https://login.example.test/authorize?client_id=x&login_hint=old%40example.test&prompt=login&state=s"
+	got, err := composeOAuthURLMode(raw, "same@example.test", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "login_hint=same%40example.test") || !strings.Contains(got, "prompt=select_account") {
+		t.Fatalf("duplicate-email flow must prefill the email and force account selection: %q", got)
 	}
 }
 
@@ -392,6 +404,118 @@ func TestValidateReplacementWaitsForCPAInventoryPropagation(t *testing.T) {
 	}
 }
 
+func TestValidateReplacementAcceptsDifferentWorkspaceWithSameEmail(t *testing.T) {
+	expected := account{Key: "old-seat", AccountID: "workspace-a", Email: "same@example.test", Physical: true}
+	replacement := account{Key: "new-seat", AccountID: "workspace-b", Email: "same@example.test", Physical: true, AccessTokenValue: "token"}
+	oldInventory := repairListAccounts
+	oldRefreshQuota := repairRefreshQuota
+	oldWaitLimit := repairReplacementWaitLimit
+	repairListAccounts = func() ([]account, error) { return []account{replacement}, nil }
+	repairRefreshQuota = func(a account) account {
+		a.QuotaStatusCode = http.StatusOK
+		a.Quota = quotaSnapshot{Windows: []quotaWindow{{Presence: windowPresent}}}
+		return a
+	}
+	repairReplacementWaitLimit = 50 * time.Millisecond
+	t.Cleanup(func() {
+		repairListAccounts = oldInventory
+		repairRefreshQuota = oldRefreshQuota
+		repairReplacementWaitLimit = oldWaitLimit
+	})
+	if err := validateReplacement(context.Background(), []account{expected}, expected); err != nil {
+		t.Fatalf("same-email replacement with a different workspace should validate: %v", err)
+	}
+}
+
+func TestReviveQueueRoutesSameEmailOAuthToTheWorkspaceActuallyReturned(t *testing.T) {
+	db, _ := setupRepairRecoveryStore(t)
+	jobID := "repair-same-email-workspaces"
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO jobs(id,kind,state,created_at,updated_at,total,done) VALUES(?,?,?,?,?,?,?)`, jobID, "revive", "running", now, now, 2, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	first := account{Key: "seat-a", AuthID: "auth-a", AuthIndex: "index-a", AccountID: "workspace-a", Email: "same@example.test", AuthPath: "/auth/a.json", AuthDir: "/auth", Physical: true, Status: "authentication_error", PhysicalModTime: 1}
+	second := account{Key: "seat-b", AuthID: "auth-b", AuthIndex: "index-b", AccountID: "workspace-b", Email: first.Email, AuthPath: "/auth/b.json", AuthDir: "/auth", Physical: true, Status: "authentication_error", PhysicalModTime: 1}
+	for i, row := range []account{first, second} {
+		if _, err := db.Exec(`INSERT INTO repair_rows(job_id,ordinal,account_key,auth_id,auth_index,email,account_id,state) VALUES(?,?,?,?,?,?,?,'queued')`, jobID, i+1, row.Key, row.AuthID, row.AuthIndex, row.Email, row.AccountID); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	secondReplacement := second
+	secondReplacement.Status = "active"
+	secondReplacement.PhysicalModTime = 2
+	secondReplacement.AccessTokenValue = "token-b"
+	firstReplacement := first
+	firstReplacement.Status = "active"
+	firstReplacement.PhysicalModTime = 2
+	firstReplacement.AccessTokenValue = "token-a"
+
+	quarantined := false
+	oauthAttempts := 0
+	oldInventory := repairListAccounts
+	oldQuarantine := repairSafeQuarantine
+	oldBind := repairBindCallbackForwarder
+	oldStartMode := repairStartNativeOAuthMode
+	oldPoll := repairPollNativeOAuth
+	oldRefreshQuota := repairRefreshQuota
+	repairListAccounts = func() ([]account, error) {
+		switch oauthAttempts {
+		case 0:
+			if quarantined {
+				return []account{second}, nil
+			}
+			return []account{first, second}, nil
+		case 1:
+			return []account{secondReplacement}, nil
+		default:
+			return []account{secondReplacement, firstReplacement}, nil
+		}
+	}
+	repairSafeQuarantine = func(string, string, string) (string, error) {
+		quarantined = true
+		return "quarantine-a.json", nil
+	}
+	repairBindCallbackForwarder = func() (*callbackForwarder, error) { return &callbackForwarder{}, nil }
+	repairStartNativeOAuthMode = func(context.Context, string, string, bool) (nativeOAuthStart, error) {
+		oauthAttempts++
+		return nativeOAuthStart{URL: "https://login.example.test/authorize", State: "state-" + strconv.Itoa(oauthAttempts)}, nil
+	}
+	repairPollNativeOAuth = func(context.Context, string, string) (string, error) { return "success", nil }
+	repairRefreshQuota = func(a account) account {
+		if a.AccessTokenValue == "" {
+			a.QuotaStatusCode = http.StatusUnauthorized
+			return a
+		}
+		a.QuotaStatusCode = http.StatusOK
+		a.Quota = quotaSnapshot{Windows: []quotaWindow{{Presence: windowPresent}}}
+		return a
+	}
+	t.Cleanup(func() {
+		repairListAccounts = oldInventory
+		repairSafeQuarantine = oldQuarantine
+		repairBindCallbackForwarder = oldBind
+		repairStartNativeOAuthMode = oldStartMode
+		repairPollNativeOAuth = oldPoll
+		repairRefreshQuota = oldRefreshQuota
+	})
+
+	runtime := &reviveRuntime{jobID: jobID, queued: []account{first, second}}
+	runReviveQueue(runtime)
+	job, err := readJob(jobID)
+	if err != nil || job.State != "completed" || job.Done != 2 {
+		t.Fatalf("job did not complete both workspace rows: job=%+v err=%v", job, err)
+	}
+	rows, err := loadRepairRows(jobID)
+	if err != nil || len(rows) != 2 || rows[0].RepairState != "repaired" || rows[1].RepairState != "repaired" {
+		t.Fatalf("workspace rows were not routed and repaired: rows=%+v err=%v", rows, err)
+	}
+	if oauthAttempts != 2 {
+		t.Fatalf("expected a second login for the remaining workspace, got %d attempts", oauthAttempts)
+	}
+}
+
 func TestReviveQueueAcceptsChangedSameKeyReplacementEndToEnd(t *testing.T) {
 	db, _ := setupRepairRecoveryStore(t)
 	jobID := "repair-same-key-replacement"
@@ -444,7 +568,7 @@ func TestReviveQueueAcceptsChangedSameKeyReplacementEndToEnd(t *testing.T) {
 		repairRefreshQuota = oldRefreshQuota
 	})
 
-	if got := processReviveRow(context.Background(), &reviveRuntime{jobID: jobID}, 1, expected); got != "repaired" {
+	if got := processReviveRow(context.Background(), &reviveRuntime{jobID: jobID, queued: []account{expected}}, 1, expected); got != "repaired" {
 		t.Fatalf("changed same-key replacement did not complete end-to-end: %q", got)
 	}
 	if inventoryCalls != 3 || quarantineCalls != 1 || oauthStarts != 1 {

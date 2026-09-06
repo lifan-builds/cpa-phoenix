@@ -553,6 +553,10 @@ func TestReplacementMatchingNeverFallsBackFromExactAccountIDToEmail(t *testing.T
 	if replacement, ok := replacementMatches(before, wrongID, expected); ok || replacement.Key != "" {
 		t.Fatalf("same-email wrong-account replacement accepted: %+v ok=%v", replacement, ok)
 	}
+	wrongEmail := []account{{Key: "new-seat", AccountID: expected.AccountID, Email: "other@example.test", AuthPath: "new", UpdatedAt: "new", Physical: true}}
+	if replacement, ok := replacementMatches(before, wrongEmail, expected); ok || replacement.Key != "" {
+		t.Fatalf("same-account-id different-email replacement accepted: %+v ok=%v", replacement, ok)
+	}
 	missingID := []account{{Key: "new-seat", Email: expected.Email, AuthPath: "new", UpdatedAt: "new", Physical: true}}
 	if replacement, ok := replacementMatches(before, missingID, expected); ok || replacement.Key != "" {
 		t.Fatalf("same-email replacement without exact account ID accepted: %+v ok=%v", replacement, ok)
@@ -586,6 +590,20 @@ func TestReplacementMatchingAcceptsChangedSameKeyAndRejectsUnchanged(t *testing.
 	}
 	if replacement, ok := replacementMatches(nil, changed, expected); ok || replacement.Key != "" {
 		t.Fatalf("same-key record without predecessor marker must be rejected: %+v ok=%v", replacement, ok)
+	}
+}
+
+func TestReplacementMatchingUsesPhysicalModTimeForSamePath(t *testing.T) {
+	expected := account{Key: "repair-seat", AccountID: "account-a"}
+	before := []account{{Key: expected.Key, AccountID: expected.AccountID, AuthPath: "/auth/codex-a.json", Physical: true, PhysicalModTime: 100}}
+	after := []account{{Key: expected.Key, AccountID: expected.AccountID, AuthPath: "/auth/codex-a.json", Physical: true, PhysicalModTime: 200}}
+	if replacement, ok := replacementMatches(before, after, expected); !ok || replacement.Key != expected.Key {
+		t.Fatalf("same-path replacement with changed physical mtime was rejected: %+v ok=%v", replacement, ok)
+	}
+	unchanged := after
+	unchanged[0].PhysicalModTime = before[0].PhysicalModTime
+	if replacement, ok := replacementMatches(before, unchanged, expected); ok || replacement.Key != "" {
+		t.Fatalf("same-path unchanged physical mtime was accepted: %+v ok=%v", replacement, ok)
 	}
 }
 

@@ -12,16 +12,20 @@ The repair flow decodes one native HTML entity layer, rejects residual
 only existing `login_hint`/`prompt` fields, appends the queued email as an
 encoded `login_hint` plus `prompt=login`, and preserves every other native
 query segment, order, and escape. It never controls an existing browser
-profile, and leaves MFA/CAPTCHA/account verification to the user. Replacement
-validation requires an exact private account ID, a new or changed physical
-update marker (including CPA's account-hash filename case), credential
-availability, and a successful quota probe. Because CPA can report native OAuth
-success before its plugin inventory exposes the saved record, Phoenix waits a
-short bounded interval for exact replacement propagation. A later resume also
-reconciles an exact already-healthy replacement without starting OAuth again.
+profile, and leaves MFA/CAPTCHA/account verification to the user. When several
+queued workspaces share an email, Phoenix identifies the credential actually
+changed by OAuth, marks the queued row with that private workspace ID repaired,
+and continues prompting for the remaining workspace; the human's selection
+order does not need to match the queue order. The credential must still be
+available and pass a successful quota probe. Because CPA can report native
+OAuth success before its plugin inventory exposes the saved record, Phoenix
+waits a short bounded interval for replacement propagation. A later resume
+also reconciles an already-healthy replacement without starting OAuth again.
 An obsolete record is moved to owner-only quarantine before login and is not
 restored automatically. The callback forwarder is temporary and binds only to
-`127.0.0.1:1455`.
+`127.0.0.1:1455`. During login, Phoenix can display a fresh matching OpenAI
+verification code from the account's Thunderbird mailbox; entering a code
+manually follows the same repair flow.
 
 This source targets CPA plugin ABI v1 and Go 1.21. It has no scheduler, usage
 handler, pricing downloader, analytics, account picker, or background timer;
@@ -59,25 +63,9 @@ dashboard JavaScript before a release review. The package script creates a
 Darwin shared library and release archive only; no runtime state or auth data
 is included.
 
-## Install and rollback gates
+## Local installation
 
-Installation into CPA, service restart, live scanning, Ignite traffic, and
-Revive OAuth are intentionally not part of an offline source build. A later
-operator must first snapshot only Phoenix/old-plugin configuration and
-artifact hashes, place the matching shared library under CPA's platform plugin
-directory, and verify loopback/API/plugin invariants before any button click.
-Keep the old token-usage plugin's traffic trigger disabled; Phoenix itself has
-no background or periodic action, and the two actions are user-initiated from
-its Management page. Rollback disables Phoenix, restores the prior plugin
-configuration/binary, and rechecks routing, affinity, scheduler, and other
-plugins. Quarantined auth files are never restored automatically.
-
-## Open-source publication checklist
-
-Publish the reviewed source tree to `lifan-builds/cpa-phoenix` only after the
-offline checks above pass. Include `LICENSE` and `NOTICE`, retain the upstream
-MIT attribution, and review the public diff/package for machine-local paths,
-account metadata, runtime state, credentials, OAuth URLs, and browser/session
-data. Do not publish installed binaries, SQLite files, auth files, or release
-artifacts copied from a live machine unless they were rebuilt from this source
-and contain only the documented package contents.
+Run `./build.sh`, copy `cpa-phoenix.dylib` into CPA's configured plugin
+directory for the current platform, and restart CPA. Phoenix has no background
+schedule; Ignite and Revive run only from its Management page. Quarantined auth
+files are not restored automatically.

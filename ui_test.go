@@ -90,7 +90,7 @@ func TestDashboardRevivePopupIsDirectClickAndValidated(t *testing.T) {
 		"phoenixValidatedOAuthURL",
 		"const raw=String(value||''),decoded=raw.replace(/&amp;/g,'&')",
 		"return decoded",
-		"phoenixNavigateReviveTab(validated)",
+		"phoenixOpenReviveLogin(validated)",
 		"reviveNavigated",
 		"reviveTab.location.replace(url)",
 		"Login window opened; complete sign-in there",
@@ -163,33 +163,6 @@ func TestDashboardActiveLoginRecoveryAnchor(t *testing.T) {
 	}
 }
 
-func TestDashboardReviveNavigationFailureKeepsRecoveryPolling(t *testing.T) {
-	dashboard := string(dashboardPageHTML())
-	showAt := strings.Index(dashboard, "phoenixShowLoginLink(validated,result.email,result.seat)")
-	failureAt := strings.Index(dashboard, "if(reviveTab&&!reviveTab.closed&&!phoenixNavigateReviveTab(validated)){")
-	if showAt < 0 || failureAt < 0 || showAt >= failureAt {
-		t.Fatal("Revive must expose the validated recovery link before popup navigation")
-	}
-	end := strings.Index(dashboard[failureAt:], "\n        }")
-	if end < 0 {
-		t.Fatal("Revive popup failure branch missing")
-	}
-	branch := dashboard[failureAt : failureAt+end]
-	for _, required := range []string{"try{reviveTab.close()}catch(e){}", "reviveTab=null;", "reviveNavigated=false;", "OAuth window unavailable; click Open current login to continue"} {
-		if !strings.Contains(branch, required) {
-			t.Fatalf("popup navigation failure must %q", required)
-		}
-	}
-	for _, forbidden := range []string{"phoenixPolledJob=''", "reviveOAuthURL=''", "phoenixClearLoginLink()", "phoenixActionInFlight=false", "scan()", "return"} {
-		if strings.Contains(branch, forbidden) {
-			t.Fatalf("popup navigation failure must not %q", forbidden)
-		}
-	}
-	if !strings.Contains(dashboard[failureAt+end:], "setTimeout(()=>poll(id,revive),1000)") {
-		t.Fatal("popup navigation failure must continue polling the active Revive job")
-	}
-}
-
 func TestDashboardOAuthValidationExecutableEntityBoundary(t *testing.T) {
 	dashboard := string(dashboardPageHTML())
 	start := strings.Index(dashboard, "function phoenixValidatedOAuthURL")
@@ -239,5 +212,75 @@ func TestDashboardIdentityProjectionAllowsEmailAndSeatOnly(t *testing.T) {
 		if strings.Contains(dashboard, forbidden) {
 			t.Fatalf("dashboard exposes forbidden field %q", forbidden)
 		}
+	}
+}
+
+func TestDashboardAdvancesWorkspaceWithoutDetectedCode(t *testing.T) {
+	dashboard := string(dashboardPageHTML())
+	script := strings.Split(strings.Split(dashboard, "<script>")[1], "</script>")[0]
+	script = strings.Replace(script, "\nscan()\n", "\n", 1)
+	harness := `
+const assert=require('node:assert/strict');
+const elements=new Map();
+global.document={querySelector(selector){
+  if(!elements.has(selector))elements.set(selector,{value:'',textContent:'',hidden:false,classList:{add(){},remove(){}},setAttribute(k,v){this[k]=v},getAttribute(k){return this[k]},removeAttribute(k){delete this[k]}});
+  return elements.get(selector);
+}};
+let opened=[],scheduled=[],blockPopup=false;
+function popup(){return {closed:false,location:{replace(url){this.url=url}},focus(){},close(){this.closed=true}}}
+global.window={open(){if(blockPopup)return null;const tab=popup();opened.push(tab);return tab}};
+global.setTimeout=fn=>scheduled.push(fn);
+`
+	harness += script + `
+(async()=>{
+  let workspace=1;
+  phoenixPolledJob='fixture';
+  authenticatedFetch=async path=>{
+    if(path.includes('/revive/code'))return new Promise(()=>{}); // Code lookup never finishes.
+    return {ok:true,json:async()=>({state:'awaiting_user',oauth_url:'https://login.test/?state='+workspace,email:'same@example.test',seat:'Seat '+workspace})};
+  };
+  phoenixPrepareReviveTab();
+  await poll('fixture',true);
+  assert.equal(opened[0].location.url,'https://login.test/?state=1');
+  opened[0].closed=true; // The first login's completion page closes its window.
+  workspace=2;
+  await scheduled.shift()();
+  assert.equal(opened.length,2,'next workspace must reopen a closed login window');
+  assert.equal(opened[1].location.url,'https://login.test/?state=2');
+  workspace=3;
+  await scheduled.shift()();
+  assert.equal(opened.length,2,'reuse a window that remains available');
+  assert.equal(opened[1].location.url,'https://login.test/?state=3');
+  opened[1].closed=true;
+  blockPopup=true;
+  workspace=4;
+  await scheduled.shift()();
+  assert.match(document.querySelector('#status').textContent,/click Open current login/);
+  assert.equal(document.querySelector('#current-login').hidden,false);
+  assert.equal(phoenixPolledJob,'fixture');
+  assert.equal(scheduled.length,1,'blocked popup must keep polling');
+  await scheduled.shift()();
+  assert.match(document.querySelector('#status').textContent,/click Open current login/,'recovery guidance must persist on the next poll');
+  blockPopup=false;
+  let prevented=false;
+  document.querySelector('#current-login').onclick({preventDefault(){prevented=true}});
+  assert.equal(prevented,true);
+  assert.equal(reviveTab,opened[2],'recovery link must retain the window handle');
+  assert.equal(reviveTab.location.url,'https://login.test/?state=4');
+  const inaccessible=reviveTab;
+  inaccessible.location.replace=()=>{throw new Error('navigation denied')};
+  blockPopup=true;
+  workspace=5;
+  await scheduled.shift()();
+  assert.equal(inaccessible.closed,true);
+  assert.equal(reviveTab,null);
+  assert.equal(phoenixPolledJob,'fixture');
+  assert.equal(document.querySelector('#current-login').href,'https://login.test/?state=5');
+  assert.equal(scheduled.length,1,'navigation failure must keep polling');
+  assert.match(document.querySelector('#status').textContent,/click Open current login/);
+})().catch(error=>{console.error(error);process.exitCode=1});
+`
+	if out, err := exec.Command("node", "-e", harness).CombinedOutput(); err != nil {
+		t.Fatalf("workspace handoff failed: %v\n%s", err, out)
 	}
 }

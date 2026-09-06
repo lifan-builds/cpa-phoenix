@@ -212,7 +212,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		}
 		return okJSON(pluginRegisterResponse{SchemaVersion: 1, Metadata: pluginMetadata{Name: "CPA Phoenix", Version: pluginVersion, Author: "lifan-builds", GitHubRepository: "https://github.com/lifan-builds/cpa-phoenix"}, Capabilities: capabilities{ManagementAPI: true}}), nil
 	case "management.register":
-		return okJSON(managementRegistrationResponse{Routes: []managementRoute{{"POST", "/plugins/cpa-phoenix/scan", "Refresh sanitized account counts."}, {"GET", "/plugins/cpa-phoenix/state", "Read sanitized job state."}, {"POST", "/plugins/cpa-phoenix/ignite", "Ignite all fresh accounts once."}, {"POST", "/plugins/cpa-phoenix/revive", "Revive all invalid accounts sequentially."}, {"POST", "/plugins/cpa-phoenix/revive/poll", "Advance the guided repair."}, {"POST", "/plugins/cpa-phoenix/revive/cancel", "Cancel the guided repair."}}, Resources: []resourceRoute{{"/dashboard", "Phoenix", "Fresh-account activation and invalid-auth repair."}}}), nil
+		return okJSON(managementRegistrationResponse{Routes: []managementRoute{{"POST", "/plugins/cpa-phoenix/scan", "Refresh sanitized account counts."}, {"GET", "/plugins/cpa-phoenix/state", "Read sanitized job state."}, {"POST", "/plugins/cpa-phoenix/ignite", "Ignite all fresh accounts once."}, {"POST", "/plugins/cpa-phoenix/revive", "Revive all invalid accounts sequentially."}, {"POST", "/plugins/cpa-phoenix/revive/poll", "Advance the guided repair."}, {"POST", "/plugins/cpa-phoenix/revive/code", "Read a fresh verification code from Thunderbird."}, {"POST", "/plugins/cpa-phoenix/revive/cancel", "Cancel the guided repair."}}, Resources: []resourceRoute{{"/dashboard", "Phoenix", "Fresh-account activation and invalid-auth repair."}}}), nil
 	case "management.handle":
 		var req managementRequest
 		if err := json.Unmarshal(request, &req); err != nil {
@@ -278,7 +278,7 @@ func routeManagement(req managementRequest) managementResponse {
 			}
 			rows = append(rows, map[string]any{"number": len(rows) + 1, "email": a.Email, "seat": stableSeatLabel(a), "status": status, "quota": quotaState})
 		}
-		return jsonResponse(200, map[string]any{"fresh": fresh, "invalid": invalid, "active": anyJobActive(), "active_job": activeJobProjection(), "accounts": rows, "repair_queue": incompleteRepairQueue()})
+		return jsonResponse(200, map[string]any{"fresh": fresh, "invalid": invalid, "active": anyJobActive(), "active_job": activeJobProjection(), "last_job": latestJobProjection(), "accounts": rows, "repair_queue": incompleteRepairQueue()})
 	case path == "/ignite" && req.Method == http.MethodPost:
 		if !acknowledged(req.Body) {
 			return jsonResponse(400, map[string]string{"error": "acknowledgement_required"})
@@ -341,6 +341,9 @@ func routeManagement(req managementRequest) managementResponse {
 			return jsonResponse(400, map[string]string{"error": "id_required"})
 		}
 		return revivePoll(id)
+	case path == "/revive/code" && req.Method == http.MethodPost:
+		id := firstQuery(req.Query, "id", "")
+		return reviveCode(id)
 	case path == "/revive/cancel" && req.Method == http.MethodPost:
 		id := firstQuery(req.Query, "id", "")
 		if id == "" {

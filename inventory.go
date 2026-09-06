@@ -75,10 +75,14 @@ type account struct {
 	AccessToken      bool
 	AccessTokenValue string
 	UpdatedAt        string
-	RepairState      string
-	Quarantine       string
-	SeatLabel        string
-	QuotaStatusCode  int
+	// PhysicalModTime is an ephemeral marker for same-path replacements. CPA
+	// may rewrite an auth file in place without exposing an UpdatedAt field.
+	// It is never persisted or returned in management projections.
+	PhysicalModTime int64
+	RepairState     string
+	Quarantine      string
+	SeatLabel       string
+	QuotaStatusCode int
 }
 
 func stableSeatLabel(a account) string {
@@ -161,6 +165,12 @@ func listAccounts() ([]account, error) {
 		}
 		key := accountKey(e)
 		authPath, authDir, authFile, physical := exactPhysicalAuthPath(e)
+		var physicalModTime int64
+		if physical {
+			if info, statErr := os.Stat(authPath); statErr == nil {
+				physicalModTime = info.ModTime().UnixNano()
+			}
+		}
 		// Do not infer a physical record from a filename alone. The host's
 		// source/path metadata and the configured top-level directory must agree.
 		if idx == "" || key == "" {
@@ -170,7 +180,7 @@ func listAccounts() ([]account, error) {
 			continue
 		}
 		out = append(out, account{
-			Key: key, AuthIndex: idx, AuthID: strings.TrimSpace(e.ID), Email: strings.TrimSpace(firstNonEmpty(e.Email, e.Account)), Provider: "codex", AuthFile: authFile, AuthPath: authPath, AuthDir: authDir, Physical: physical, Disabled: e.Disabled || strings.EqualFold(e.Status, "disabled"), Expired: e.Expired || strings.EqualFold(e.Status, "expired"), Unavailable: e.Unavailable, Status: strings.TrimSpace(e.Status), StatusMessage: strings.TrimSpace(e.StatusMessage), UpdatedAt: firstNonEmpty(e.UpdatedAt, e.ModTime),
+			Key: key, AuthIndex: idx, AuthID: strings.TrimSpace(e.ID), Email: strings.TrimSpace(firstNonEmpty(e.Email, e.Account)), Provider: "codex", AuthFile: authFile, AuthPath: authPath, AuthDir: authDir, Physical: physical, PhysicalModTime: physicalModTime, Disabled: e.Disabled || strings.EqualFold(e.Status, "disabled"), Expired: e.Expired || strings.EqualFold(e.Status, "expired"), Unavailable: e.Unavailable, Status: strings.TrimSpace(e.Status), StatusMessage: strings.TrimSpace(e.StatusMessage), UpdatedAt: firstNonEmpty(e.UpdatedAt, e.ModTime),
 		})
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Key < out[j].Key })
@@ -389,7 +399,7 @@ func resolveRepairAccount(accounts []account, expected account) (account, bool) 
 		if verified.AccountID == "" {
 			verified = refreshCredential(verified)
 		}
-		if strings.TrimSpace(verified.AccountID) == strings.TrimSpace(expected.AccountID) {
+		if strings.TrimSpace(verified.AccountID) == strings.TrimSpace(expected.AccountID) && exactRepairEmail(verified.Email, expected.Email) {
 			return verified, true
 		}
 	}
@@ -406,6 +416,9 @@ func resolveRepairAccount(accounts []account, expected account) (account, bool) 
 		if strings.TrimSpace(candidate.AccountID) != strings.TrimSpace(expected.AccountID) {
 			continue
 		}
+		if !exactRepairEmail(candidate.Email, expected.Email) {
+			continue
+		}
 		byAccountID = candidate
 		accountMatches++
 	}
@@ -413,6 +426,14 @@ func resolveRepairAccount(accounts []account, expected account) (account, bool) 
 		return account{}, false
 	}
 	return byAccountID, true
+}
+
+func exactRepairEmail(candidate, expected string) bool {
+	expected = strings.TrimSpace(expected)
+	if expected == "" {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(candidate), expected)
 }
 
 func refreshQuota(a account) account {
@@ -471,7 +492,7 @@ func replacementMatches(before, after []account, expected account) (account, boo
 		}
 		// A replacement without the exact private account ID is never safe to
 		// accept. Shared email addresses identify a pool, not a seat.
-		same := expected.AccountID != "" && a.AccountID != "" && expected.AccountID == a.AccountID
+		same := expected.AccountID != "" && a.AccountID != "" && expected.AccountID == a.AccountID && exactRepairEmail(a.Email, expected.Email)
 		if same {
 			prior, existed := beforeByKey[a.Key]
 			// A pre-existing seat is not the replacement. A same-key
@@ -479,7 +500,15 @@ func replacementMatches(before, after []account, expected account) (account, boo
 			// physical update marker after quarantine; without a predecessor
 			// marker there is no proof that this record was newly written.
 			if a.Key == expected.Key {
-				if !existed || !replacementMarkerChanged(prior, a) {
+				// A resumed row has already quarantined its predecessor, so the
+				// pre-OAuth inventory intentionally contains no entry for this key.
+				// In that case the newly materialized exact identity is the only
+				// safe same-key candidate. Fresh (non-quarantined) rows still require
+				// a changed physical marker to reject an unchanged pre-existing file.
+				if !existed && strings.TrimSpace(expected.Quarantine) == "" {
+					continue
+				}
+				if existed && !replacementMarkerChanged(prior, a) {
 					continue
 				}
 			} else if existed {
@@ -493,6 +522,9 @@ func replacementMatches(before, after []account, expected account) (account, boo
 
 func replacementMarkerChanged(before, after account) bool {
 	if before.AuthPath != after.AuthPath || before.AuthFile != after.AuthFile {
+		return true
+	}
+	if before.PhysicalModTime != 0 && after.PhysicalModTime != 0 && before.PhysicalModTime != after.PhysicalModTime {
 		return true
 	}
 	if strings.TrimSpace(before.UpdatedAt) == "" || strings.TrimSpace(after.UpdatedAt) == "" {

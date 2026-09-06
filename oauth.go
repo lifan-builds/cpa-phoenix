@@ -47,6 +47,10 @@ func nativeRequest(ctx context.Context, method, path, managementAuthorization st
 }
 
 func startNativeOAuth(ctx context.Context, managementAuthorization, email string) (nativeOAuthStart, error) {
+	return startNativeOAuthMode(ctx, managementAuthorization, email, false)
+}
+
+func startNativeOAuthMode(ctx context.Context, managementAuthorization, email string, selectAccount bool) (nativeOAuthStart, error) {
 	// Deliberately omit is_webui=true. CPA's Web UI helper binds wildcard :1455;
 	// Phoenix owns the exact IPv4 loopback callback forwarder instead.
 	resp, err := nativeRequestFn(ctx, http.MethodGet, "/v0/management/codex-auth-url", managementAuthorization, url.Values{"is_webui": []string{"false"}})
@@ -62,7 +66,7 @@ func startNativeOAuth(ctx context.Context, managementAuthorization, email string
 		return nativeOAuthStart{}, errors.New("oauth_start_invalid")
 	}
 	raw.URL = decodeNativeOAuthHTMLEntityLayer(raw.URL)
-	composed, err := composeOAuthURL(raw.URL, email)
+	composed, err := composeOAuthURLMode(raw.URL, email, selectAccount)
 	if err != nil {
 		return nativeOAuthStart{}, err
 	}

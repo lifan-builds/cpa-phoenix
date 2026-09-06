@@ -136,4 +136,8 @@ func TestResolveRepairAccountRejectsAmbiguousOrEmailOnlyMatches(t *testing.T) {
 	if resolved, ok := resolveRepairAccount([]account{emptyIdentity}, emptyIdentity); ok || resolved.Key != "" {
 		t.Fatalf("host key without persisted private identity must never resolve: %+v ok=%v", resolved, ok)
 	}
+	wrongEmail := account{Key: "team-different-email", AccountID: expected.AccountID, Email: "other@example.test", Physical: true}
+	if resolved, ok := resolveRepairAccount([]account{wrongEmail}, expected); ok || resolved.Key != "" {
+		t.Fatalf("same private ID with a different email must never resolve: %+v ok=%v", resolved, ok)
+	}
 }

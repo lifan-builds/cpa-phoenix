@@ -426,6 +426,19 @@ func activeJobProjection() map[string]any {
 	return map[string]any{"id": id, "kind": kind, "state": state}
 }
 
+func latestJobProjection() map[string]any {
+	db, err := openStore()
+	if err != nil {
+		return nil
+	}
+	var id, kind, state, reason, result string
+	var total, done int
+	if err := db.QueryRow(`SELECT id,kind,state,total,done,reason,result_json FROM jobs ORDER BY updated_at DESC LIMIT 1`).Scan(&id, &kind, &state, &total, &done, &reason, &result); err != nil {
+		return nil
+	}
+	return map[string]any{"id": id, "kind": kind, "state": state, "total": total, "done": done, "reason": reason, "result": result}
+}
+
 func incompleteRepairQueue() []map[string]any {
 	db, err := openStore()
 	if err != nil {

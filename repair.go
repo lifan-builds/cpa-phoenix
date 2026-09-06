@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -32,6 +33,7 @@ var (
 	repairSafeQuarantine        = safeQuarantine
 	repairBindCallbackForwarder = bindCallbackForwarder
 	repairStartNativeOAuth      = startNativeOAuth
+	repairStartNativeOAuthMode  = startNativeOAuthMode
 	repairPollNativeOAuth       = pollNativeOAuth
 	repairRefreshQuota          = refreshQuota
 	repairReplacementWaitLimit  = 5 * time.Second
@@ -167,11 +169,27 @@ func forwardCallbackWithState(w http.ResponseWriter, r *http.Request, expectedSt
 		return false
 	}
 	defer resp.Body.Close()
+	// CPA returns a small completion page. Relay its headers/body so the
+	// browser does not appear to hang on the callback URL after sign-in.
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
 	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, io.LimitReader(resp.Body, 1<<20))
 	return true
 }
 
 func composeOAuthURL(raw, email string) (string, error) {
+	return composeOAuthURLMode(raw, email, false)
+}
+
+// composeOAuthURLMode keeps native PKCE/query bytes intact while optionally
+// forcing the provider's account chooser. Duplicate local seats can share an
+// email address, so a login hint would otherwise make it too easy to select
+// the wrong workspace.
+func composeOAuthURLMode(raw, email string, selectAccount bool) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil {
 		return "", errors.New("oauth_url_invalid")
@@ -228,6 +246,11 @@ func composeOAuthURL(raw, email string) (string, error) {
 		return raw, nil
 	}
 	prefill := []string{"login_hint=" + url.QueryEscape(strings.TrimSpace(email)), "prompt=login"}
+	if selectAccount {
+		// Keep the chooser for duplicate-email seats, but prefill the email so a
+		// fresh sign-in does not make the operator type it again.
+		prefill[1] = "prompt=select_account"
+	}
 	parts := append(kept, prefill...)
 	return prefix + "?" + strings.Join(parts, "&") + fragment, nil
 }
@@ -318,9 +341,12 @@ type reviveRuntime struct {
 	state      string
 	oauthURL   string
 	oauthState string
-	queued     []account
-	started    bool
-	cancel     context.CancelFunc
+	// verificationRequestedAt is runtime-only and gates Thunderbird matches so
+	// a code from an earlier OAuth attempt can never be reused.
+	verificationRequestedAt time.Time
+	queued                  []account
+	started                 bool
+	cancel                  context.CancelFunc
 }
 
 var reviveRuntimeState = struct {
@@ -528,8 +554,9 @@ func runReviveQueue(runtime *reviveRuntime) {
 	runtime.cancel = cancel
 	runtime.mu.Unlock()
 	defer cancel()
-	for ordinal := runtime.startAt; ordinal < len(runtime.queued); ordinal++ {
+	for ordinal := runtime.startAt; ordinal < len(runtime.queued); {
 		if runtime.queued[ordinal].RepairState == "repaired" {
+			ordinal++
 			continue
 		}
 		if ctx.Err() != nil {
@@ -540,6 +567,10 @@ func runReviveQueue(runtime *reviveRuntime) {
 		runtime.current = ordinal
 		runtime.mu.Unlock()
 		state := processReviveRow(ctx, runtime, ordinal+1, runtime.queued[ordinal])
+		if state == "repaired_other" {
+			updateJob(runtime.jobID, "running", "", repairedRowCount(runtime.queued))
+			continue
+		}
 		if state != "repaired" {
 			// An explicit cancellation owns the stopped row's recovery state:
 			// leave its queued/quarantined marker intact so a later explicit
@@ -554,9 +585,23 @@ func runReviveQueue(runtime *reviveRuntime) {
 			updateJob(runtime.jobID, safeState, state, ordinal)
 			return
 		}
-		updateJob(runtime.jobID, "running", "", ordinal+1)
+		runtime.mu.Lock()
+		runtime.queued[ordinal].RepairState = "repaired"
+		runtime.mu.Unlock()
+		updateJob(runtime.jobID, "running", "", repairedRowCount(runtime.queued))
+		ordinal++
 	}
 	updateJob(runtime.jobID, "completed", "", len(runtime.queued))
+}
+
+func repairedRowCount(rows []account) int {
+	count := 0
+	for _, row := range rows {
+		if row.RepairState == "repaired" {
+			count++
+		}
+	}
+	return count
 }
 
 func processReviveRow(ctx context.Context, runtime *reviveRuntime, ordinal int, expected account) string {
@@ -657,11 +702,26 @@ func processReviveRow(ctx context.Context, runtime *reviveRuntime, ordinal int, 
 		if err := updateRepairRow(runtime.jobID, ordinal, "quarantined", "", quarantine); err != nil {
 			return "state_unavailable"
 		}
+		runtime.mu.Lock()
+		if ordinal > 0 && ordinal <= len(runtime.queued) {
+			runtime.queued[ordinal-1].RepairState = "quarantined"
+			runtime.queued[ordinal-1].Quarantine = filepath.Base(quarantine)
+		}
+		runtime.mu.Unlock()
 		if err := waitForOldRecordGone(ctx, current); err != nil {
 			return err.Error()
 		}
 	}
-	started, err := repairStartNativeOAuth(ctx, runtime.authHeader, current.Email)
+	runtime.mu.Lock()
+	runtime.verificationRequestedAt = time.Now()
+	runtime.mu.Unlock()
+	selectAccount := queuedEmailCount(runtime.queued, current.Email) > 1
+	var started nativeOAuthStart
+	if selectAccount {
+		started, err = repairStartNativeOAuthMode(ctx, runtime.authHeader, current.Email, true)
+	} else {
+		started, err = repairStartNativeOAuth(ctx, runtime.authHeader, current.Email)
+	}
 	if err != nil {
 		return "oauth_start_failed"
 	}
@@ -699,19 +759,42 @@ func processReviveRow(ctx context.Context, runtime *reviveRuntime, ordinal int, 
 		switch status {
 		case "wait":
 			updateJob(runtime.jobID, "awaiting_user", "", ordinal-1)
+			// The user (or another process) may repair this exact seat while the
+			// OAuth page is open. Re-read the inventory and quota before waiting
+			// again; a definitive 2xx means the row is complete and no second
+			// OAuth attempt is needed.
+			if accounts, listErr := repairListAccounts(); listErr == nil {
+				if replacement, ok := resolveRepairAccount(accounts, expected); ok {
+					replacement = repairRefreshQuota(replacement)
+					if definitiveHealthy(replacement) {
+						if err := updateRepairRow(runtime.jobID, ordinal, "repaired", "already_healthy"); err != nil {
+							return "state_unavailable"
+						}
+						return "repaired"
+					}
+				}
+			}
 			select {
 			case <-ctx.Done():
 				return "cancelled"
 			case <-time.After(2 * time.Second):
 			}
 		case "success":
-			if err := validateReplacement(ctx, before, expected); err != nil {
+			replacement, err := validatedReplacement(ctx, before, expected)
+			if err != nil {
 				return err.Error()
 			}
-			if err := updateRepairRow(runtime.jobID, ordinal, "repaired", ""); err != nil {
+			target := queuedReplacementOrdinal(runtime.queued, replacement)
+			if target == 0 {
+				return "replacement_not_queued"
+			}
+			if err := updateRepairRow(runtime.jobID, target, "repaired", ""); err != nil {
 				return "state_unavailable"
 			}
 			runtime.mu.Lock()
+			if target > 0 && target <= len(runtime.queued) {
+				runtime.queued[target-1].RepairState = "repaired"
+			}
 			runtime.oauthURL = ""
 			runtime.oauthState = ""
 			if runtime.forwarder != nil {
@@ -719,11 +802,46 @@ func processReviveRow(ctx context.Context, runtime *reviveRuntime, ordinal int, 
 			}
 			runtime.mu.Unlock()
 			oauthSucceeded = true
+			if target != ordinal {
+				return "repaired_other"
+			}
 			return "repaired"
 		default:
 			return "oauth_failed"
 		}
 	}
+}
+
+func queuedReplacementOrdinal(queued []account, replacement account) int {
+	accountID := strings.TrimSpace(replacement.AccountID)
+	if accountID == "" {
+		return 0
+	}
+	match := 0
+	for i, candidate := range queued {
+		if strings.TrimSpace(candidate.AccountID) != accountID || !exactRepairEmail(candidate.Email, replacement.Email) {
+			continue
+		}
+		if match != 0 {
+			return 0
+		}
+		match = i + 1
+	}
+	return match
+}
+
+func queuedEmailCount(queued []account, email string) int {
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return 0
+	}
+	count := 0
+	for _, candidate := range queued {
+		if strings.EqualFold(strings.TrimSpace(candidate.Email), email) {
+			count++
+		}
+	}
+	return count
 }
 
 func waitForOldRecordGone(ctx context.Context, expected account) error {
@@ -759,24 +877,35 @@ func waitForOldRecordGone(ctx context.Context, expected account) error {
 }
 
 func validateReplacement(ctx context.Context, before []account, expected account) error {
+	_, err := validatedReplacement(ctx, before, expected)
+	return err
+}
+
+func validatedReplacement(ctx context.Context, before []account, expected account) (account, error) {
 	deadline := time.Now().Add(repairReplacementWaitLimit)
 	lastErr := errors.New("replacement_mismatch")
 	for {
 		after, err := repairListAccounts()
 		if err != nil {
 			lastErr = errors.New("replacement_unavailable")
-		} else if replacement, ok := replacementMatches(before, after, expected); ok {
-			replacement = refreshCredential(replacement)
-			if credentialAvailable(replacement) {
-				validated := repairRefreshQuota(replacement)
-				if !quotaReadValidated(validated.Quota) {
-					return errors.New("replacement_unvalidated")
+		} else {
+			replacement, ok := replacementMatches(before, after, expected)
+			if !ok {
+				replacement, ok = changedSameEmailReplacement(before, after, expected)
+			}
+			if ok {
+				replacement = refreshCredential(replacement)
+				if credentialAvailable(replacement) {
+					validated := repairRefreshQuota(replacement)
+					if quotaReadValidated(validated.Quota) {
+						return replacement, nil
+					}
+					return account{}, errors.New("replacement_unvalidated")
 				}
-				return nil
 			}
 		}
 		if !time.Now().Before(deadline) {
-			return lastErr
+			return account{}, lastErr
 		}
 		timer := time.NewTimer(repairReplacementPollDelay)
 		select {
@@ -784,10 +913,35 @@ func validateReplacement(ctx context.Context, before []account, expected account
 			if !timer.Stop() {
 				<-timer.C
 			}
-			return errors.New("cancelled")
+			return account{}, errors.New("cancelled")
 		case <-timer.C:
 		}
 	}
+}
+
+func changedSameEmailReplacement(before, after []account, expected account) (account, bool) {
+	beforeByKey := make(map[string]account, len(before))
+	for _, candidate := range before {
+		beforeByKey[candidate.Key] = candidate
+	}
+	var match account
+	found := 0
+	for _, candidate := range after {
+		if !candidate.Physical || !exactRepairEmail(candidate.Email, expected.Email) {
+			continue
+		}
+		if candidate.AccountID == "" {
+			candidate = captureRepairIdentity(candidate)
+		}
+		if strings.TrimSpace(candidate.AccountID) == "" {
+			continue
+		}
+		if prior, existed := beforeByKey[candidate.Key]; existed && !replacementMarkerChanged(prior, candidate) {
+			continue
+		}
+		match, found = candidate, found+1
+	}
+	return match, found == 1
 }
 
 func quotaReadValidated(quota quotaSnapshot) bool {
@@ -847,6 +1001,45 @@ func revivePoll(id string) managementResponse {
 	}
 	reviveRuntimeState.Unlock()
 	return jsonResponse(http.StatusOK, result)
+}
+
+// reviveCode performs a best-effort, read-only lookup for the currently active
+// row. The value is returned only in this response and is never persisted or
+// logged by Phoenix.
+func reviveCode(id string) managementResponse {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return jsonResponse(http.StatusBadRequest, map[string]string{"error": "id_required"})
+	}
+	snapshot, err := readJob(id)
+	if err != nil || snapshot.Kind != "revive" {
+		return jsonResponse(http.StatusNotFound, map[string]string{"error": "not_found"})
+	}
+	if snapshot.State != "running" && snapshot.State != "awaiting_user" {
+		return jsonResponse(http.StatusConflict, map[string]string{"error": "no_active_row"})
+	}
+	reviveRuntimeState.Lock()
+	runtime := reviveRuntimeState.jobs[id]
+	if runtime == nil {
+		reviveRuntimeState.Unlock()
+		return jsonResponse(http.StatusConflict, map[string]string{"error": "no_active_row"})
+	}
+	runtime.mu.Lock()
+	ordinal := runtime.current
+	requestedAt := runtime.verificationRequestedAt
+	if ordinal < 0 || ordinal >= len(runtime.queued) || requestedAt.IsZero() {
+		runtime.mu.Unlock()
+		reviveRuntimeState.Unlock()
+		return jsonResponse(http.StatusConflict, map[string]string{"error": "no_active_row"})
+	}
+	recipient := runtime.queued[ordinal].Email
+	runtime.mu.Unlock()
+	reviveRuntimeState.Unlock()
+	code, err := detectThunderbirdCode(recipient, requestedAt)
+	if err != nil {
+		return jsonResponse(http.StatusOK, map[string]any{"job_id": id, "detected": false, "reason": strings.TrimSpace(err.Error())})
+	}
+	return jsonResponse(http.StatusOK, map[string]any{"job_id": id, "detected": true, "code": code.Code, "received_at": code.ReceivedAt.UTC().Format(time.RFC3339)})
 }
 
 func cancelRevive(id string, headers map[string][]string) bool {
