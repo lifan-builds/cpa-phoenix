@@ -15,9 +15,9 @@ import (
 	"time"
 )
 
-func TestComposeOAuthURLPrefillsWithoutReserializingNativeFields(t *testing.T) {
+func TestComposeOAuthURLModePrefillsWithoutReserializingNativeFields(t *testing.T) {
 	raw := "https://login.example.test/authorize?prompt=select_account&login_hint=old%40example.test&state=opaque&x=%2F"
-	got, err := composeOAuthURL(raw, "seat@example.test")
+	got, err := composeOAuthURLMode(raw, "seat@example.test", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -29,14 +29,14 @@ func TestComposeOAuthURLPrefillsWithoutReserializingNativeFields(t *testing.T) {
 		t.Fatalf("prefill fields must occur exactly once: %q", got)
 	}
 	for _, invalid := range []string{"", "http://login.example.test/a", "https://user:pass@login.example.test/a", "https://login.example.test/a?state=one;two", "not a url"} {
-		if _, err := composeOAuthURL(invalid, ""); err == nil {
+		if _, err := composeOAuthURLMode(invalid, "", false); err == nil {
 			t.Fatalf("invalid URL accepted: %q", invalid)
 		}
 	}
 }
 
-func TestComposeOAuthURLPrefillEscapesPlusEmail(t *testing.T) {
-	got, err := composeOAuthURL("https://login.example.test/authorize?client_id=x&code_challenge=a%2Bb&state=s", "plus+tag@example.test")
+func TestComposeOAuthURLModePrefillEscapesPlusEmail(t *testing.T) {
+	got, err := composeOAuthURLMode("https://login.example.test/authorize?client_id=x&code_challenge=a%2Bb&state=s", "plus+tag@example.test", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,16 +59,16 @@ func TestComposeOAuthURLSelectsAccountForDuplicateEmailSeats(t *testing.T) {
 	}
 }
 
-func TestComposeOAuthURLEmptyEmailLeavesValidatedNativeBytes(t *testing.T) {
+func TestComposeOAuthURLModeEmptyEmailLeavesValidatedNativeBytes(t *testing.T) {
 	raw := "https://login.example.test/authorize?client_id=x&prompt=login&state=s&x=%2F#fragment"
-	got, err := composeOAuthURL(raw, "")
+	got, err := composeOAuthURLMode(raw, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got != raw {
 		t.Fatalf("empty email must leave native URL unchanged: got %q want %q", got, raw)
 	}
-	if _, err := composeOAuthURL("https://login.example.test/authorize?client_id=x&amp;state=s", ""); err == nil {
+	if _, err := composeOAuthURLMode("https://login.example.test/authorize?client_id=x&amp;state=s", "", false); err == nil {
 		t.Fatal("residual amp-prefixed query key must still be rejected without email")
 	}
 }
@@ -138,7 +138,7 @@ func TestComposeOAuthURLRejectsResidualEntityPrefixedQueryKeys(t *testing.T) {
 	if !strings.Contains(raw, "&amp;state=fixture") {
 		t.Fatalf("nested entity was decoded more than once before validation: %q", raw)
 	}
-	if _, err := composeOAuthURL(raw, ""); err == nil {
+	if _, err := composeOAuthURLMode(raw, "", false); err == nil {
 		t.Fatal("entity-prefixed query key must be rejected before navigation")
 	}
 }
@@ -364,7 +364,7 @@ func TestReviveQueueReconcilesHealthyReplacementAfterQuarantinedMismatch(t *test
 	}
 }
 
-func TestValidateReplacementWaitsForCPAInventoryPropagation(t *testing.T) {
+func TestValidatedReplacementWaitsForCPAInventoryPropagation(t *testing.T) {
 	expected := account{Key: "repair-seat", AuthIndex: "auth-index", AccountID: "account-a", Physical: true, UpdatedAt: "before"}
 	replacement := expected
 	replacement.UpdatedAt = "after"
@@ -396,7 +396,7 @@ func TestValidateReplacementWaitsForCPAInventoryPropagation(t *testing.T) {
 		repairReplacementPollDelay = oldPollDelay
 	})
 
-	if err := validateReplacement(context.Background(), []account{expected}, expected); err != nil {
+	if _, err := validatedReplacement(context.Background(), []account{expected}, expected); err != nil {
 		t.Fatalf("replacement propagation should validate: %v", err)
 	}
 	if inventoryCalls < 2 {
@@ -404,7 +404,7 @@ func TestValidateReplacementWaitsForCPAInventoryPropagation(t *testing.T) {
 	}
 }
 
-func TestValidateReplacementAcceptsDifferentWorkspaceWithSameEmail(t *testing.T) {
+func TestValidatedReplacementAcceptsDifferentWorkspaceWithSameEmail(t *testing.T) {
 	expected := account{Key: "old-seat", AccountID: "workspace-a", Email: "same@example.test", Physical: true}
 	replacement := account{Key: "new-seat", AccountID: "workspace-b", Email: "same@example.test", Physical: true, AccessTokenValue: "token"}
 	oldInventory := repairListAccounts
@@ -422,7 +422,7 @@ func TestValidateReplacementAcceptsDifferentWorkspaceWithSameEmail(t *testing.T)
 		repairRefreshQuota = oldRefreshQuota
 		repairReplacementWaitLimit = oldWaitLimit
 	})
-	if err := validateReplacement(context.Background(), []account{expected}, expected); err != nil {
+	if _, err := validatedReplacement(context.Background(), []account{expected}, expected); err != nil {
 		t.Fatalf("same-email replacement with a different workspace should validate: %v", err)
 	}
 }

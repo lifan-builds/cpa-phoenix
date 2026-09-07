@@ -181,10 +181,6 @@ func forwardCallbackWithState(w http.ResponseWriter, r *http.Request, expectedSt
 	return true
 }
 
-func composeOAuthURL(raw, email string) (string, error) {
-	return composeOAuthURLMode(raw, email, false)
-}
-
 // composeOAuthURLMode keeps native PKCE/query bytes intact while optionally
 // forcing the provider's account chooser. Duplicate local seats can share an
 // email address, so a login hint would otherwise make it too easy to select
@@ -874,11 +870,6 @@ func waitForOldRecordGone(ctx context.Context, expected account) error {
 		case <-timer.C:
 		}
 	}
-}
-
-func validateReplacement(ctx context.Context, before []account, expected account) error {
-	_, err := validatedReplacement(ctx, before, expected)
-	return err
 }
 
 func validatedReplacement(ctx context.Context, before []account, expected account) (account, error) {
