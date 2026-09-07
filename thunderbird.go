@@ -33,6 +33,7 @@ var thunderbirdHTMLTagPattern = regexp.MustCompile(`(?s)<[^>]+>`)
 
 var trustedThunderbirdSenders = map[string]struct{}{
 	"noreply@tm.openai.com":   {},
+	"noreply@tm1.openai.com":  {},
 	"noreply@openai.com":      {},
 	"no-reply@openai.com":     {},
 	"do-not-reply@openai.com": {},
@@ -465,17 +466,12 @@ func detectThunderbirdCode(recipient string, requestedAt time.Time) (thunderbird
 	}
 	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].ReceivedAt.After(candidates[j].ReceivedAt) })
 	latest := candidates[0]
-	ambiguous := 0
 	for _, candidate := range candidates {
 		if candidate.ReceivedAt.Equal(latest.ReceivedAt) {
-			ambiguous++
 			if candidate.Code != latest.Code {
 				return thunderbirdCode{}, errors.New("verification_code_ambiguous")
 			}
 		}
-	}
-	if ambiguous > 1 {
-		return thunderbirdCode{}, errors.New("verification_code_ambiguous")
 	}
 	return thunderbirdCode{Code: latest.Code, ReceivedAt: latest.ReceivedAt, Recipient: recipient}, nil
 }
