@@ -38,7 +38,16 @@ var (
 	repairRefreshQuota          = refreshQuota
 	repairReplacementWaitLimit  = 5 * time.Second
 	repairReplacementPollDelay  = 100 * time.Millisecond
+	repairNewLoginBrowser       = func(ctx context.Context) (loginBrowserController, error) { return newLoginBrowser(ctx) }
 )
+
+// loginBrowserController is owned for the lifetime of one Revive queue. Each
+// OAuth row gets a cancellable Run call, while CPA's native poll remains the
+// authority for whether login and replacement validation succeeded.
+type loginBrowserController interface {
+	Close() error
+	Run(context.Context, string, string, string, time.Time, func(string)) error
+}
 
 func invalidAccount(a account, statusCode int) bool {
 	if !a.Physical {
@@ -337,6 +346,11 @@ type reviveRuntime struct {
 	state      string
 	oauthURL   string
 	oauthState string
+	browser    loginBrowserController
+	// automationStatus is a transient, sanitized controller status. It is never
+	// written to SQLite or logs and intentionally remains visible between OAuth
+	// URL publication and native replacement validation.
+	automationStatus string
 	// verificationRequestedAt is runtime-only and gates Thunderbird matches so
 	// a code from an earlier OAuth attempt can never be reused.
 	verificationRequestedAt time.Time
@@ -550,6 +564,28 @@ func runReviveQueue(runtime *reviveRuntime) {
 	runtime.cancel = cancel
 	runtime.mu.Unlock()
 	defer cancel()
+	runtime.setAutomationStatus("browser_starting")
+	browser, err := repairNewLoginBrowser(ctx)
+	if err != nil || browser == nil {
+		runtime.setAutomationStatus("browser_unavailable")
+		if runtime.startAt >= 0 && runtime.startAt < len(runtime.queued) {
+			_ = updateRepairRow(runtime.jobID, runtime.startAt+1, "failed", "browser_unavailable")
+		}
+		updateJob(runtime.jobID, "failed", "browser_unavailable", repairedRowCount(runtime.queued))
+		return
+	}
+	runtime.mu.Lock()
+	runtime.browser = browser
+	runtime.mu.Unlock()
+	defer func() {
+		_ = browser.Close()
+		runtime.mu.Lock()
+		if runtime.browser == browser {
+			runtime.browser = nil
+		}
+		runtime.mu.Unlock()
+	}()
+	runtime.setAutomationStatus("browser_ready")
 	for ordinal := runtime.startAt; ordinal < len(runtime.queued); {
 		if runtime.queued[ordinal].RepairState == "repaired" {
 			ordinal++
@@ -664,6 +700,15 @@ func processReviveRow(ctx context.Context, runtime *reviveRuntime, ordinal int, 
 			return "no_longer_invalid"
 		}
 	}
+	runtime.mu.Lock()
+	browser := runtime.browser
+	runtime.mu.Unlock()
+	// Queue startup owns the browser before any predecessor can be quarantined.
+	// Keep this guard here as well so direct callers cannot mutate an auth file
+	// without a usable automatic controller.
+	if browser == nil {
+		return "browser_unavailable"
+	}
 	// Own the exact callback port for this row only. A later queued row must
 	// prove ownership again after this listener is closed.
 	forwarder, err := repairBindCallbackForwarder()
@@ -709,7 +754,8 @@ func processReviveRow(ctx context.Context, runtime *reviveRuntime, ordinal int, 
 		}
 	}
 	runtime.mu.Lock()
-	runtime.verificationRequestedAt = time.Now()
+	requestedAt := time.Now()
+	runtime.verificationRequestedAt = requestedAt
 	runtime.mu.Unlock()
 	selectAccount := queuedEmailCount(runtime.queued, current.Email) > 1
 	var started nativeOAuthStart
@@ -738,6 +784,19 @@ func processReviveRow(ctx context.Context, runtime *reviveRuntime, ordinal int, 
 	runtime.mu.Lock()
 	runtime.oauthURL, runtime.oauthState = started.URL, started.State
 	runtime.mu.Unlock()
+	attemptCtx, cancelAttempt := context.WithCancel(ctx)
+	browserDone := make(chan struct{})
+	go func() {
+		defer close(browserDone)
+		err := browser.Run(attemptCtx, started.URL, current.Email, expected.AccountID, requestedAt, runtime.setAutomationStatus)
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			runtime.setAutomationStatus(sanitizeAutomationStatus(err.Error()))
+		}
+	}()
+	defer func() {
+		cancelAttempt()
+		<-browserDone
+	}()
 	// The page receives the URL through the transient status response. The raw
 	// URL/state never enter SQLite or logs.
 	if err := setRepairAwaiting(runtime.jobID, ordinal, started.URL); err != nil {
@@ -754,7 +813,7 @@ func processReviveRow(ctx context.Context, runtime *reviveRuntime, ordinal int, 
 		}
 		switch status {
 		case "wait":
-			updateJob(runtime.jobID, "awaiting_user", "", ordinal-1)
+			updateJob(runtime.jobID, "awaiting_user", "", repairedRowCount(runtime.queued))
 			// The user (or another process) may repair this exact seat while the
 			// OAuth page is open. Re-read the inventory and quota before waiting
 			// again; a definitive 2xx means the row is complete and no second
@@ -974,11 +1033,17 @@ func revivePoll(id string) managementResponse {
 	if err != nil {
 		return jsonResponse(http.StatusNotFound, map[string]string{"error": "not_found"})
 	}
-	result := map[string]any{"job_id": snapshot.ID, "state": snapshot.State, "done": snapshot.Done, "total": snapshot.Total}
+	result := map[string]any{"job_id": snapshot.ID, "state": snapshot.State, "done": snapshot.Done, "total": snapshot.Total, "automatic": true}
+	if snapshot.Reason != "" {
+		result["reason"] = snapshot.Reason
+	}
 	reviveRuntimeState.Lock()
 	runtime := reviveRuntimeState.jobs[id]
 	if runtime != nil {
 		runtime.mu.Lock()
+		if runtime.automationStatus != "" {
+			result["automation_status"] = runtime.automationStatus
+		}
 		if runtime.oauthURL != "" && (snapshot.State == "running" || snapshot.State == "awaiting_user") {
 			result["oauth_url"] = runtime.oauthURL
 			result["awaiting_user"] = snapshot.State == "awaiting_user"
@@ -992,6 +1057,28 @@ func revivePoll(id string) managementResponse {
 	}
 	reviveRuntimeState.Unlock()
 	return jsonResponse(http.StatusOK, result)
+}
+
+func (runtime *reviveRuntime) setAutomationStatus(status string) {
+	if strings.TrimSpace(status) == "" {
+		return
+	}
+	status = sanitizeAutomationStatus(status)
+	runtime.mu.Lock()
+	runtime.automationStatus = status
+	runtime.mu.Unlock()
+}
+
+func sanitizeAutomationStatus(status string) string {
+	switch strings.TrimSpace(status) {
+	case "browser_starting", "browser_ready", "browser_unavailable", "browser_navigation_failed", "browser_automation_failed", "oauth_url_invalid",
+		"login_opened", "email_submitted", "email_code_requested", "verification_code_waiting", "verification_code_submitted", "verification_code_resent",
+		"workspace_selected", "manual_workspace_selection_required", "manual_password_required", "manual_captcha_required",
+		"manual_login_required", "manual_recipient_mismatch", "callback_reached", "login_window_closed":
+		return strings.TrimSpace(status)
+	default:
+		return "browser_automation_failed"
+	}
 }
 
 // reviveCode performs a best-effort, read-only lookup for the currently active

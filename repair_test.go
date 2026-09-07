@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -11,9 +12,45 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+type fakeLoginBrowser struct {
+	mu       sync.Mutex
+	run      func(context.Context, string, string, string, time.Time, func(string)) error
+	runs     int
+	active   int
+	closed   int
+	overlaps int
+}
+
+func (b *fakeLoginBrowser) Run(ctx context.Context, oauthURL, email, accountID string, requestedAt time.Time, report func(string)) error {
+	b.mu.Lock()
+	b.runs++
+	if b.active != 0 {
+		b.overlaps++
+	}
+	b.active++
+	b.mu.Unlock()
+	defer func() {
+		b.mu.Lock()
+		b.active--
+		b.mu.Unlock()
+	}()
+	if b.run != nil {
+		return b.run(ctx, oauthURL, email, accountID, requestedAt, report)
+	}
+	return nil
+}
+
+func (b *fakeLoginBrowser) Close() error {
+	b.mu.Lock()
+	b.closed++
+	b.mu.Unlock()
+	return nil
+}
 
 func TestComposeOAuthURLModePrefillsWithoutReserializingNativeFields(t *testing.T) {
 	raw := "https://login.example.test/authorize?prompt=select_account&login_hint=old%40example.test&state=opaque&x=%2F"
@@ -460,6 +497,20 @@ func TestReviveQueueRoutesSameEmailOAuthToTheWorkspaceActuallyReturned(t *testin
 	oldStartMode := repairStartNativeOAuthMode
 	oldPoll := repairPollNativeOAuth
 	oldRefreshQuota := repairRefreshQuota
+	oldNewBrowser := repairNewLoginBrowser
+	browser := &fakeLoginBrowser{run: func(ctx context.Context, oauthURL, email, accountID string, requestedAt time.Time, report func(string)) error {
+		if oauthURL == "" || email != first.Email || requestedAt.IsZero() {
+			t.Errorf("automatic login received incomplete attempt data: url=%q email=%q requested=%v", oauthURL, email, requestedAt)
+		}
+		if accountID != first.AccountID && accountID != second.AccountID {
+			t.Errorf("automatic login received unexpected workspace %q", accountID)
+		}
+		report("email_code_requested")
+		report("verification_code_submitted")
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	repairNewLoginBrowser = func(context.Context) (loginBrowserController, error) { return browser, nil }
 	repairListAccounts = func() ([]account, error) {
 		switch oauthAttempts {
 		case 0:
@@ -499,6 +550,7 @@ func TestReviveQueueRoutesSameEmailOAuthToTheWorkspaceActuallyReturned(t *testin
 		repairStartNativeOAuthMode = oldStartMode
 		repairPollNativeOAuth = oldPoll
 		repairRefreshQuota = oldRefreshQuota
+		repairNewLoginBrowser = oldNewBrowser
 	})
 
 	runtime := &reviveRuntime{jobID: jobID, queued: []account{first, second}}
@@ -513,6 +565,12 @@ func TestReviveQueueRoutesSameEmailOAuthToTheWorkspaceActuallyReturned(t *testin
 	}
 	if oauthAttempts != 2 {
 		t.Fatalf("expected a second login for the remaining workspace, got %d attempts", oauthAttempts)
+	}
+	browser.mu.Lock()
+	runs, closed, overlaps, active := browser.runs, browser.closed, browser.overlaps, browser.active
+	browser.mu.Unlock()
+	if runs != 2 || closed != 1 || overlaps != 0 || active != 0 {
+		t.Fatalf("browser queue lifecycle: runs=%d closed=%d overlaps=%d active=%d", runs, closed, overlaps, active)
 	}
 }
 
@@ -568,7 +626,7 @@ func TestReviveQueueAcceptsChangedSameKeyReplacementEndToEnd(t *testing.T) {
 		repairRefreshQuota = oldRefreshQuota
 	})
 
-	if got := processReviveRow(context.Background(), &reviveRuntime{jobID: jobID, queued: []account{expected}}, 1, expected); got != "repaired" {
+	if got := processReviveRow(context.Background(), &reviveRuntime{jobID: jobID, queued: []account{expected}, browser: &fakeLoginBrowser{}}, 1, expected); got != "repaired" {
 		t.Fatalf("changed same-key replacement did not complete end-to-end: %q", got)
 	}
 	if inventoryCalls != 3 || quarantineCalls != 1 || oauthStarts != 1 {
@@ -688,10 +746,12 @@ func installRepairTestDeps(t *testing.T, inventory func() ([]account, error), qu
 	oldStart := repairStartNativeOAuth
 	oldPoll := repairPollNativeOAuth
 	oldRefreshQuota := repairRefreshQuota
+	oldNewBrowser := repairNewLoginBrowser
 	repairListAccounts = inventory
 	repairSafeQuarantine = quarantine
 	repairBindCallbackForwarder = func() (*callbackForwarder, error) { return &callbackForwarder{}, nil }
 	repairStartNativeOAuth = start
+	repairNewLoginBrowser = func(context.Context) (loginBrowserController, error) { return &fakeLoginBrowser{}, nil }
 	t.Cleanup(func() {
 		repairListAccounts = oldInventory
 		repairSafeQuarantine = oldQuarantine
@@ -699,7 +759,73 @@ func installRepairTestDeps(t *testing.T, inventory func() ([]account, error), qu
 		repairStartNativeOAuth = oldStart
 		repairPollNativeOAuth = oldPoll
 		repairRefreshQuota = oldRefreshQuota
+		repairNewLoginBrowser = oldNewBrowser
 	})
+}
+
+func TestReviveBrowserUnavailableFailsBeforeQuarantine(t *testing.T) {
+	db, _ := setupRepairRecoveryStore(t)
+	jobID := "repair-browser-unavailable"
+	seedRepairRecoveryState(t, db, jobID, "running", "queued", "")
+	expected := account{Key: "repair-seat", AccountID: "account-a", Email: "seat@example.test", AuthPath: "/auth/seat.json", AuthDir: "/auth", Physical: true, Status: "authentication_error"}
+	var quarantineCalls int
+	installRepairTestDeps(t,
+		func() ([]account, error) { return []account{expected}, nil },
+		func(string, string, string) (string, error) { quarantineCalls++; return "unexpected", nil },
+		func(context.Context, string, string) (nativeOAuthStart, error) {
+			return nativeOAuthStart{}, errors.New("unexpected_oauth")
+		},
+	)
+	repairNewLoginBrowser = func(context.Context) (loginBrowserController, error) {
+		return nil, errors.New("private detail must be sanitized")
+	}
+	runReviveQueue(&reviveRuntime{jobID: jobID, queued: []account{expected}})
+	job, err := readJob(jobID)
+	if err != nil || job.State != "failed" || job.Reason != "browser_unavailable" {
+		t.Fatalf("browser startup failure was not sanitized: job=%+v err=%v", job, err)
+	}
+	if quarantineCalls != 0 {
+		t.Fatalf("browser startup failure quarantined %d files", quarantineCalls)
+	}
+	rows, err := loadRepairRows(jobID)
+	if err != nil || len(rows) != 1 || rows[0].RepairState != "failed" || rows[0].Quarantine != "" {
+		t.Fatalf("browser startup failure left unsafe row state: rows=%+v err=%v", rows, err)
+	}
+	poll := revivePoll(jobID)
+	var body map[string]any
+	if err := json.Unmarshal(poll.Body, &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["automatic"] != true || body["reason"] != "browser_unavailable" {
+		t.Fatalf("terminal automatic failure was not readable after runtime cleanup: %v", body)
+	}
+}
+
+func TestRevivePollExposesTransientAutomationStatusWithoutOAuthURL(t *testing.T) {
+	db, _ := setupRepairRecoveryStore(t)
+	jobID := "repair-automatic-status"
+	seedRepairRecoveryState(t, db, jobID, "running", "queued", "")
+	runtime := &reviveRuntime{jobID: jobID, automationStatus: "verification_code_waiting"}
+	reviveRuntimeState.Lock()
+	reviveRuntimeState.jobs[jobID] = runtime
+	reviveRuntimeState.Unlock()
+	t.Cleanup(func() {
+		reviveRuntimeState.Lock()
+		delete(reviveRuntimeState.jobs, jobID)
+		reviveRuntimeState.Unlock()
+	})
+
+	poll := revivePoll(jobID)
+	var body map[string]any
+	if err := json.Unmarshal(poll.Body, &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["automatic"] != true || body["automation_status"] != "verification_code_waiting" {
+		t.Fatalf("transient automatic status missing without OAuth URL: %v", body)
+	}
+	if _, ok := body["oauth_url"]; ok {
+		t.Fatalf("poll invented an OAuth URL: %v", body)
+	}
 }
 
 func waitForRepairJobState(t *testing.T, id, want string) stateResponse {

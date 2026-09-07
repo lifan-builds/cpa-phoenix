@@ -4,15 +4,18 @@ CPA Phoenix is a small CLIProxyAPI plugin with exactly two management actions:
 
 * **Ignite Fresh Accounts** sends one compact request through each currently
   fresh, eligible Codex seat, once per quota cycle.
-* **Revive Invalid Accounts** guides a sequential native CPA OAuth login for
+* **Revive Invalid Accounts** runs sequential native CPA OAuth logins for
   each physically stored Codex record classified as HTTP 401 or invalid.
+  Phoenix opens its own Chrome window, enters the email and fresh Thunderbird
+  verification code, selects the matching workspace, and advances the queue.
 
 The repair flow decodes one native HTML entity layer, rejects residual
 `amp;` query keys, and applies a bounded Butler-compatible prefill: it removes
 only existing `login_hint`/`prompt` fields, appends the queued email as an
 encoded `login_hint` plus `prompt=login`, and preserves every other native
-query segment, order, and escape. It never controls an existing browser
-profile, and leaves MFA/CAPTCHA/account verification to the user. When several
+query segment, order, and escape. It uses a dedicated Chrome profile and leaves
+unrecognized challenges, CAPTCHA, and non-email MFA to the user in that window.
+When several
 queued workspaces share an email, Phoenix identifies the credential actually
 changed by OAuth, marks the queued row with that private workspace ID repaired,
 and continues prompting for the remaining workspace; the human's selection
@@ -23,9 +26,27 @@ waits a short bounded interval for replacement propagation. A later resume
 also reconciles an already-healthy replacement without starting OAuth again.
 An obsolete record is moved to owner-only quarantine before login and is not
 restored automatically. The callback forwarder is temporary and binds only to
-`127.0.0.1:1455`. During login, Phoenix can display a fresh matching OpenAI
+`127.0.0.1:1455`. During login, Phoenix enters a fresh matching OpenAI
 verification code from the account's Thunderbird mailbox; entering a code
-manually follows the same repair flow.
+manually in the Chrome window follows the same repair flow.
+
+## Automatic repair
+
+Install Google Chrome and configure the account mailboxes in Thunderbird with
+message synchronization enabled (including downloading message bodies). Phoenix
+starts Thunderbird for mail delivery and uses its existing local mail files;
+it does not need your mailbox password. Click **Revive Invalid Accounts** in
+the existing Management page. The plugin owns the browser and queue, so the
+dashboard can be closed and no Codex agent needs to remain running.
+
+Phoenix keeps its Chrome profile under
+`~/.cli-proxy-api-state/cpa-phoenix/browser`. This is separate from your normal
+Chrome profile. Workspace selection requires an exact matching workspace ID
+in OpenAI's page. If the page changes, the matching workspace is absent, or a
+challenge needs your help, the dashboard explains that intervention is needed;
+finish that step in Phoenix's Chrome window. Successful OAuth and a quota
+probe remain the authority for marking a workspace repaired. Each login
+attempt has a five-minute timeout; an interrupted queue can be resumed.
 
 This source targets CPA plugin ABI v1 and Go 1.21. It has no scheduler, usage
 handler, pricing downloader, analytics, account picker, or background timer;
@@ -33,8 +54,8 @@ there is no automatic trigger. The source is version 0.1.0. Installation,
 authentication, and upstream traffic remain explicit operator-controlled
 actions and are never initiated by a source build.
 
-Fully unattended completion is intentionally a future item: Phoenix does not
-bypass MFA, CAPTCHA, login prompts, or an existing browser profile.
+Email-code logins can complete unattended while Thunderbird is receiving mail.
+Other verification challenges may still require your interaction.
 
 ## Build and package
 

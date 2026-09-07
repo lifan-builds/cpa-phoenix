@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"os/exec"
 	"strings"
 	"testing"
@@ -79,39 +78,6 @@ func TestDashboardDisablesZeroCountsAndRendersIgniteResults(t *testing.T) {
 	}
 }
 
-func TestDashboardRevivePopupIsDirectClickAndValidated(t *testing.T) {
-	dashboard := string(dashboardPageHTML())
-	if strings.Count(dashboard, "window.open('about:blank','cpa-phoenix-oauth')") != 1 {
-		t.Fatal("Revive must open exactly one named about:blank window")
-	}
-	for _, required := range []string{
-		"reviveTab.opener=null",
-		"reviveTab.focus()",
-		"phoenixValidatedOAuthURL",
-		"const raw=String(value||''),decoded=raw.replace(/&amp;/g,'&')",
-		"return decoded",
-		"phoenixOpenReviveLogin(validated)",
-		"reviveNavigated",
-		"reviveTab.location.replace(url)",
-		"Login window opened; complete sign-in there",
-		"OAuth window blocked; allow pop-ups and click Revive again",
-		"phoenixSetActionAvailability(result.fresh,result.invalid,result.active,result.repair_queue)",
-	} {
-		if !strings.Contains(dashboard, required) {
-			t.Fatalf("dashboard missing %q", required)
-		}
-	}
-	if strings.Contains(dashboard, "window.open(x.oauth_url") || strings.Contains(dashboard, "phoenixPrepareReviveTab();if(reviveTab)reviveTab.location.replace") {
-		t.Fatal("OAuth navigation must not open a second asynchronous popup")
-	}
-	openAt := strings.Index(dashboard, "window.open('about:blank','cpa-phoenix-oauth')")
-	navigateAt := strings.Index(dashboard, "reviveTab.location.replace(url)")
-	detachAt := strings.Index(dashboard, "reviveTab.opener=null")
-	if openAt < 0 || detachAt <= openAt || navigateAt <= detachAt {
-		t.Fatal("Revive must detach the opener before validated OAuth navigation starts")
-	}
-}
-
 func TestDashboardRepairQueueSummaryAndPrivacy(t *testing.T) {
 	dashboard := string(dashboardPageHTML())
 	for _, required := range []string{
@@ -141,63 +107,13 @@ func TestDashboardVisualTokensAndResponsiveSemantics(t *testing.T) {
 
 func TestDashboardPhoenixBrandCountsAndConsequences(t *testing.T) {
 	dashboard := string(dashboardPageHTML())
-	for _, required := range []string{"<svg viewBox=\"0 0 24 24\"", "id=\"fresh\" class=\"count-badge\"", "id=\"invalid\" class=\"count-badge\"", "Ignite sends one minimal request per fresh exact seat.", "Revive replaces invalid credentials sequentially through guided login.", "--success-bg:#064e3b4d", "--error-bg:#c657463d", ".status-badge.neutral"} {
+	for _, required := range []string{"<svg viewBox=\"0 0 24 24\"", "id=\"fresh\" class=\"count-badge\"", "id=\"invalid\" class=\"count-badge\"", "Ignite sends one minimal request per fresh exact seat.", "Revive opens Chrome, enters email codes, and repairs each workspace automatically.", "--success-bg:#064e3b4d", "--error-bg:#c657463d", ".status-badge.neutral"} {
 		if !strings.Contains(dashboard, required) {
 			t.Fatalf("dashboard missing polish contract %q", required)
 		}
 	}
 	if strings.Contains(dashboard, ">live<") {
 		t.Fatal("redundant live pills must be removed")
-	}
-}
-
-func TestDashboardActiveLoginRecoveryAnchor(t *testing.T) {
-	dashboard := string(dashboardPageHTML())
-	for _, required := range []string{"id=\"current-login\"", "Open current login", "target=\"_blank\"", "rel=\"noopener noreferrer\"", "active_job", "phoenixShowLoginLink(validated,result.email,result.seat)", "phoenixClearLoginLink()", "[hidden]{display:none!important}", "setAttribute('href',url)", "removeAttribute('href')"} {
-		if !strings.Contains(dashboard, required) {
-			t.Fatalf("dashboard missing recovery affordance %q", required)
-		}
-	}
-	if strings.Contains(dashboard, "window.open(x.oauth_url") {
-		t.Fatal("recovery must not open an asynchronous second popup")
-	}
-}
-
-func TestDashboardOAuthValidationExecutableEntityBoundary(t *testing.T) {
-	dashboard := string(dashboardPageHTML())
-	start := strings.Index(dashboard, "function phoenixValidatedOAuthURL")
-	end := strings.Index(dashboard[start:], "\nfunction phoenixNavigateReviveTab")
-	if start < 0 || end < 0 {
-		t.Fatal("validator function missing")
-	}
-	fn := dashboard[start : start+end]
-	script := fn + `
-const values=[
-  'https://login.test/a?client_id=x&code_challenge=abc%2Bxyz&redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fcallback&state=s&login_hint=fixture%40example.test&prompt=login&x=%2F',
-  'https://login.test/a?client_id=x&amp;code_challenge=abc%2Bxyz&amp;redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fcallback&amp;state=s&amp;login_hint=fixture%40example.test&amp;prompt=login&amp;x=%2F',
-  'https://LOGIN.TEST:443/a/../authorize?client_id=x&state=s&x=%2F',
-  'https://login.test/a?client_id=x&amp;amp;state=s',
-  'https://login.test/a?client_id=x&amp;amp;state',
-  'http://login.test/a?state=s',
-  'https://user:pass@login.test/a?state=s',
-  'not a url'
-];
-console.log(JSON.stringify(values.map(phoenixValidatedOAuthURL)));`
-	out, err := exec.Command("node", "-e", script).Output()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var got []string
-	if err := json.Unmarshal(out, &got); err != nil {
-		t.Fatal(err)
-	}
-	want := "https://login.test/a?client_id=x&code_challenge=abc%2Bxyz&redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fcallback&state=s&login_hint=fixture%40example.test&prompt=login&x=%2F"
-	preserved := "https://LOGIN.TEST:443/a/../authorize?client_id=x&state=s&x=%2F"
-	if got[0] != want || got[1] != want || got[2] != preserved || got[3] != "" || got[4] != "" || got[5] != "" || got[6] != "" || got[7] != "" {
-		t.Fatalf("unexpected executable validation results: %#v", got)
-	}
-	if strings.Count(got[1], "login_hint=") != 1 || strings.Count(got[1], "prompt=") != 1 || strings.Contains(got[1], "amp;") {
-		t.Fatalf("browser validator altered entity/query contract: %q", got[1])
 	}
 }
 
@@ -215,9 +131,8 @@ func TestDashboardIdentityProjectionAllowsEmailAndSeatOnly(t *testing.T) {
 	}
 }
 
-func TestDashboardAdvancesWorkspaceWithoutDetectedCode(t *testing.T) {
-	dashboard := string(dashboardPageHTML())
-	script := strings.Split(strings.Split(dashboard, "<script>")[1], "</script>")[0]
+func TestDashboardAutomaticRepairDoesNotOpenPopupsOrFetchCodes(t *testing.T) {
+	script := strings.Split(strings.Split(dashboardHTML, "<script>")[1], "</script>")[0]
 	script = strings.Replace(script, "\nscan()\n", "\n", 1)
 	harness := `
 const assert=require('node:assert/strict');
@@ -226,61 +141,30 @@ global.document={querySelector(selector){
   if(!elements.has(selector))elements.set(selector,{value:'',textContent:'',hidden:false,classList:{add(){},remove(){}},setAttribute(k,v){this[k]=v},getAttribute(k){return this[k]},removeAttribute(k){delete this[k]}});
   return elements.get(selector);
 }};
-let opened=[],scheduled=[],blockPopup=false;
-function popup(){return {closed:false,location:{replace(url){this.url=url}},focus(){},close(){this.closed=true}}}
-global.window={open(){if(blockPopup)return null;const tab=popup();opened.push(tab);return tab}};
+global.window={open(){throw Error('automatic repair must not open dashboard popups')}};
+const scheduled=[];
 global.setTimeout=fn=>scheduled.push(fn);
-`
-	harness += script + `
+` + script + `
 (async()=>{
-  let workspace=1;
-  phoenixPolledJob='fixture';
+  post=async()=>({job_id:'fixture',state:'running'});
+  let attempt=1;
   authenticatedFetch=async path=>{
-    if(path.includes('/revive/code'))return new Promise(()=>{}); // Code lookup never finishes.
-    return {ok:true,json:async()=>({state:'awaiting_user',oauth_url:'https://login.test/?state='+workspace,email:'same@example.test',seat:'Seat '+workspace})};
+    assert.ok(!path.includes('/revive/code'),'the browser controller owns code submission');
+    return {ok:true,json:async()=>({automatic:true,state:'awaiting_user',done:attempt-1,total:2,
+      oauth_url:'https://auth.openai.com/oauth/authorize?state='+attempt,email:'same@example.test',
+      automation_status:'Entering verification code'})};
   };
-  phoenixPrepareReviveTab();
-  await poll('fixture',true);
-  assert.equal(opened[0].location.url,'https://login.test/?state=1');
-  opened[0].closed=true; // The first login's completion page closes its window.
-  workspace=2;
+  await run('revive');
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.match(document.querySelector('#status').textContent,/Entering verification code/);
+  assert.equal(elements.has('#current-login'),false);
+  attempt=2;
   await scheduled.shift()();
-  assert.equal(opened.length,2,'next workspace must reopen a closed login window');
-  assert.equal(opened[1].location.url,'https://login.test/?state=2');
-  workspace=3;
-  await scheduled.shift()();
-  assert.equal(opened.length,2,'reuse a window that remains available');
-  assert.equal(opened[1].location.url,'https://login.test/?state=3');
-  opened[1].closed=true;
-  blockPopup=true;
-  workspace=4;
-  await scheduled.shift()();
-  assert.match(document.querySelector('#status').textContent,/click Open current login/);
-  assert.equal(document.querySelector('#current-login').hidden,false);
-  assert.equal(phoenixPolledJob,'fixture');
-  assert.equal(scheduled.length,1,'blocked popup must keep polling');
-  await scheduled.shift()();
-  assert.match(document.querySelector('#status').textContent,/click Open current login/,'recovery guidance must persist on the next poll');
-  blockPopup=false;
-  let prevented=false;
-  document.querySelector('#current-login').onclick({preventDefault(){prevented=true}});
-  assert.equal(prevented,true);
-  assert.equal(reviveTab,opened[2],'recovery link must retain the window handle');
-  assert.equal(reviveTab.location.url,'https://login.test/?state=4');
-  const inaccessible=reviveTab;
-  inaccessible.location.replace=()=>{throw new Error('navigation denied')};
-  blockPopup=true;
-  workspace=5;
-  await scheduled.shift()();
-  assert.equal(inaccessible.closed,true);
-  assert.equal(reviveTab,null);
-  assert.equal(phoenixPolledJob,'fixture');
-  assert.equal(document.querySelector('#current-login').href,'https://login.test/?state=5');
-  assert.equal(scheduled.length,1,'navigation failure must keep polling');
-  assert.match(document.querySelector('#status').textContent,/click Open current login/);
+  assert.match(document.querySelector('#status').textContent,/1\/2/);
+  assert.equal(elements.has('#verification-code'),false);
 })().catch(error=>{console.error(error);process.exitCode=1});
 `
 	if out, err := exec.Command("node", "-e", harness).CombinedOutput(); err != nil {
-		t.Fatalf("workspace handoff failed: %v\n%s", err, out)
+		t.Fatalf("automatic dashboard flow failed: %v\n%s", err, out)
 	}
 }
