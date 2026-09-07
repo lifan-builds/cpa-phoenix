@@ -157,14 +157,49 @@ global.setTimeout=fn=>scheduled.push(fn);
   await run('revive');
   await new Promise(resolve=>setImmediate(resolve));
   assert.match(document.querySelector('#status').textContent,/Entering verification code/);
-  assert.equal(elements.has('#current-login'),false);
+  assert.equal(document.querySelector('#agent-login').hidden,true);
   attempt=2;
   await scheduled.shift()();
   assert.match(document.querySelector('#status').textContent,/1\/2/);
-  assert.equal(elements.has('#verification-code'),false);
+  assert.equal(document.querySelector('#verification-code').value,'');
 })().catch(error=>{console.error(error);process.exitCode=1});
 `
 	if out, err := exec.Command("node", "-e", harness).CombinedOutput(); err != nil {
 		t.Fatalf("automatic dashboard flow failed: %v\n%s", err, out)
+	}
+}
+
+func TestDashboardAgentModeRejectsLateCodeFromPreviousAttempt(t *testing.T) {
+	script := strings.Split(strings.Split(dashboardHTML, "<script>")[1], "</script>")[0]
+	script = strings.Replace(script, "\nscan()\n", "\n", 1)
+	harness := `
+const assert=require('node:assert/strict'),elements=new Map();
+global.document={querySelector(s){if(!elements.has(s))elements.set(s,{value:'',checked:false,textContent:'',classList:{add(){},remove(){}},setAttribute(k,v){this[k]=v},removeAttribute(k){delete this[k]}});return elements.get(s)}};
+global.window={};global.setTimeout=()=>{};
+` + script + `
+(async()=>{
+  document.querySelector('#agent-mode').checked=true;
+  post=async(kind,body)=>{assert.equal(kind,'revive');assert.equal(body.browser_mode,'agent');return {state:'running'}};
+  await run('revive');
+  phoenixPolledJob='job';
+  const row=attempt=>({attempt,oauth_url:'https://auth.openai.com/oauth/authorize?state='+attempt,email:'same@example.test',seat:'seat-12345678'});
+  phoenixShowAgentLogin(row('first'));
+  let release;
+  authenticatedFetch=()=>new Promise(resolve=>release=resolve);
+  const pending=phoenixReadAgentCode('job','first');
+  phoenixShowAgentLogin(row('second'));
+  release({ok:true,json:async()=>({attempt:'first',detected:true,code:'111111'})});
+  await pending;
+  assert.equal(document.querySelector('#verification-code').value,'');
+  authenticatedFetch=async()=>({ok:true,json:async()=>({attempt:'second',detected:true,code:'222222'})});
+  await phoenixReadAgentCode('job','second');
+  assert.equal(document.querySelector('#verification-code').value,'222222');
+  phoenixClearAgentLogin();
+  assert.equal(document.querySelector('#agent-login').hidden,true);
+  assert.equal(document.querySelector('#verification-code').value,'');
+})().catch(e=>{console.error(e);process.exitCode=1});
+`
+	if out, err := exec.Command("node", "-e", harness).CombinedOutput(); err != nil {
+		t.Fatalf("agent code handoff failed: %v\n%s", err, out)
 	}
 }

@@ -30,13 +30,20 @@ const dashboardHTML = `<!doctype html>
       <h2>Revive Invalid Accounts</h2>
       <p><span id="invalid" class="count-badge" aria-label="repair queue count">Scanning…</span></p><p>Revive opens Chrome, enters email codes, and repairs each workspace automatically.</p>
       <button id="revive" disabled>Revive Invalid Accounts</button>
+      <label><input id="agent-mode" type="checkbox"> Use regular Chrome with the Phoenix repair skill</label>
     </section>
   </main>
   <div id="accounts"></div>
-  <p id="status" role="status" aria-live="polite"></p></div>
+  <p id="status" role="status" aria-live="polite"></p>
+  <div id="agent-login" hidden>
+    <a id="current-login" target="_blank" rel="noopener noreferrer">Open current login</a>
+    <label>Verification code <input id="verification-code" readonly autocomplete="off"></label>
+    <span id="verification-state" role="status"></span>
+  </div></div>
   <script>
 const cpaStoragePrefix='enc::v1::',cpaSecureStorageSalt='cli-proxy-api-webui::secure-storage';
 let phoenixManagementKey='',phoenixRejectedManagementKey='',phoenixActionInFlight=false,phoenixScanSequence=0,phoenixPolledJob='';
+let phoenixAttempt='',phoenixCodeBusy=false;
 
 function safeStorage(kind){try{return window[kind+'Storage']}catch(e){return null}}
 function readStorageText(storage,name){try{return String(storage&&storage.getItem(name)||'').trim()}catch(e){return ''}}
@@ -110,6 +117,7 @@ function phoenixRenderAccounts(rows,queue){
 function phoenixSetActionAvailability(fresh,invalid,active,queue){
   const locked=phoenixActionInFlight||Boolean(active),hasQueue=Boolean((queue||[]).length),button=document.querySelector('#revive');
   document.querySelector('#ignite').disabled=locked||Number(fresh||0)<=0;
+  document.querySelector('#agent-mode').disabled=locked;
   button.disabled=locked||(Number(invalid||0)<=0&&!hasQueue);
   button.textContent=active?'Repair In Progress':(hasQueue?'Resume Repair Queue':'Revive Invalid Accounts');
   document.querySelector('#invalid').textContent=hasQueue?(String((queue||[]).length)+' in repair queue · '+String(invalid||0)+' still invalid in CPA'):String(invalid||0)+' actionable'
@@ -150,6 +158,7 @@ async function scan(){
       if(phoenixPolledJob!==result.active_job.id){phoenixPolledJob=result.active_job.id;poll(result.active_job.id,true)}
     }else{
       phoenixPolledJob='';
+      phoenixClearAgentLogin();
       if(result.last_job)document.querySelector('#status').textContent=phoenixRenderJob(result.last_job)
     }
     document.querySelector('#auth-fallback').classList.remove('on')
@@ -166,7 +175,9 @@ async function run(kind){
   phoenixSetActionAvailability(0,0,true,[]);
   document.querySelector('#status').textContent='Working…';
   try{
-    const result=await post(kind,{acknowledge:'CPA_PHOENIX_ONE_CLICK'});
+    const body={acknowledge:'CPA_PHOENIX_ONE_CLICK'};
+    if(kind==='revive'&&document.querySelector('#agent-mode').checked)body.browser_mode='agent';
+    const result=await post(kind,body);
     document.querySelector('#status').textContent='Job '+(result.job_id||'started')+' is '+(result.state||'running');
     if(result.job_id){if(kind==='revive')phoenixPolledJob=result.job_id;poll(result.job_id,kind==='revive')}
   }catch(e){
@@ -183,8 +194,13 @@ async function poll(id,revive=false){
       const result=await response.json();
       document.querySelector('#status').textContent=phoenixRenderJob(result);
       if(revive&&result.automatic){
+        phoenixClearAgentLogin();
         document.querySelector('#status').textContent=phoenixRenderJob(result)+(result.email?' · '+String(result.email):'')+(result.automation_status?' — '+phoenixAutomationMessage(result.automation_status):'');
       }
+      if(revive&&!result.automatic&&result.oauth_url&&result.attempt){
+        phoenixShowAgentLogin(result);
+        phoenixReadAgentCode(id,result.attempt);
+      }else if(revive&&!result.automatic){phoenixClearAgentLogin()}
       if(result.state==='running'||result.state==='awaiting_user'){
         setTimeout(()=>poll(id,revive),1000);
         return
@@ -194,8 +210,42 @@ async function poll(id,revive=false){
     if(e.message!=='management_key_required'&&e.message!=='management_unauthorized')document.querySelector('#status').textContent='Job status unavailable'
   }
   phoenixPolledJob='';
+  phoenixClearAgentLogin();
   phoenixActionInFlight=false;
   scan()
+}
+
+function phoenixClearAgentLogin(){
+  phoenixAttempt='';
+  document.querySelector('#agent-login').hidden=true;
+  document.querySelector('#current-login').removeAttribute('href');
+  document.querySelector('#verification-code').value='';
+}
+function phoenixShowAgentLogin(result){
+  const url=new URL(result.oauth_url);
+  if(url.origin!=='https://auth.openai.com'||url.username||url.password)throw Error('oauth_url_invalid');
+  if(phoenixAttempt!==result.attempt){
+    phoenixAttempt=result.attempt;
+    document.querySelector('#verification-code').value='';
+    document.querySelector('#verification-state').textContent='Waiting for fresh mail…';
+  }
+  const link=document.querySelector('#current-login');
+  link.setAttribute('href',result.oauth_url);
+  link.textContent='Open current login · '+String(result.email||'')+' · '+String(result.seat||'');
+  document.querySelector('#agent-login').setAttribute('data-attempt',result.attempt);
+  document.querySelector('#agent-login').hidden=false;
+}
+async function phoenixReadAgentCode(id,attempt){
+  if(phoenixCodeBusy)return;
+  phoenixCodeBusy=true;
+  try{
+    const response=await authenticatedFetch('/v0/management/plugins/cpa-phoenix/revive/code?id='+encodeURIComponent(id)+'&attempt='+encodeURIComponent(attempt),{method:'POST'});
+    if(!response.ok)return;
+    const result=await response.json();
+    if(phoenixPolledJob!==id||phoenixAttempt!==attempt||result.attempt!==attempt)return;
+    document.querySelector('#verification-code').value=result.detected?String(result.code||''):'';
+    document.querySelector('#verification-state').textContent=result.detected?'Code ready':String(result.reason||'Waiting for fresh mail…');
+  }catch(e){}finally{phoenixCodeBusy=false}
 }
 
 document.querySelector('#management-key').onchange=event=>{phoenixManagementKey=String(event.target.value||'').trim();scan()};

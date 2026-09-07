@@ -32,6 +32,14 @@ manually in the Chrome window follows the same repair flow.
 
 ## Automatic repair
 
+For regular Chrome, use the repo-local
+[phoenix-repair skill](.agents/skills/phoenix-repair/SKILL.md): ask Codex to
+`Use $phoenix-repair to repair invalid accounts`. The skill selects **Use regular
+Chrome with the Phoenix repair skill** before starting Revive. Phoenix still
+owns the queue, mail-code lookup, callback, and quota validation; the agent only
+operates the login pages. This mode avoids launching a second automated Chrome.
+The skill lives in `.agents/skills` for repository discovery.
+
 Install Google Chrome and configure the account mailboxes in Thunderbird with
 message synchronization enabled (including downloading message bodies). Phoenix
 starts Thunderbird for mail delivery and uses its existing local mail files;

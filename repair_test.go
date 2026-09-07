@@ -465,6 +465,11 @@ func TestValidatedReplacementAcceptsDifferentWorkspaceWithSameEmail(t *testing.T
 }
 
 func TestReviveQueueRoutesSameEmailOAuthToTheWorkspaceActuallyReturned(t *testing.T) {
+	t.Run("automatic", func(t *testing.T) { testReviveWorkspaceQueue(t, reviveBrowserModeAutomatic) })
+	t.Run("agent", func(t *testing.T) { testReviveWorkspaceQueue(t, reviveBrowserModeAgent) })
+}
+
+func testReviveWorkspaceQueue(t *testing.T, mode string) {
 	db, _ := setupRepairRecoveryStore(t)
 	jobID := "repair-same-email-workspaces"
 	now := time.Now().Unix()
@@ -510,7 +515,12 @@ func TestReviveQueueRoutesSameEmailOAuthToTheWorkspaceActuallyReturned(t *testin
 		<-ctx.Done()
 		return ctx.Err()
 	}}
-	repairNewLoginBrowser = func(context.Context) (loginBrowserController, error) { return browser, nil }
+	repairNewLoginBrowser = func(context.Context) (loginBrowserController, error) {
+		if mode == reviveBrowserModeAgent {
+			t.Fatal("agent mode launched a browser")
+		}
+		return browser, nil
+	}
 	repairListAccounts = func() ([]account, error) {
 		switch oauthAttempts {
 		case 0:
@@ -553,7 +563,7 @@ func TestReviveQueueRoutesSameEmailOAuthToTheWorkspaceActuallyReturned(t *testin
 		repairNewLoginBrowser = oldNewBrowser
 	})
 
-	runtime := &reviveRuntime{jobID: jobID, queued: []account{first, second}}
+	runtime := &reviveRuntime{jobID: jobID, queued: []account{first, second}, browserMode: mode}
 	runReviveQueue(runtime)
 	job, err := readJob(jobID)
 	if err != nil || job.State != "completed" || job.Done != 2 {
@@ -569,7 +579,11 @@ func TestReviveQueueRoutesSameEmailOAuthToTheWorkspaceActuallyReturned(t *testin
 	browser.mu.Lock()
 	runs, closed, overlaps, active := browser.runs, browser.closed, browser.overlaps, browser.active
 	browser.mu.Unlock()
-	if runs != 2 || closed != 1 || overlaps != 0 || active != 0 {
+	wantRuns, wantClosed := 2, 1
+	if mode == reviveBrowserModeAgent {
+		wantRuns, wantClosed = 0, 0
+	}
+	if runs != wantRuns || closed != wantClosed || overlaps != 0 || active != 0 {
 		t.Fatalf("browser queue lifecycle: runs=%d closed=%d overlaps=%d active=%d", runs, closed, overlaps, active)
 	}
 }
@@ -841,6 +855,51 @@ func waitForRepairJobState(t *testing.T, id, want string) stateResponse {
 	job, err := readJob(id)
 	t.Fatalf("job %q did not reach %q: job=%+v err=%v", id, want, job, err)
 	return stateResponse{}
+}
+
+func TestAgentPollAndCodeShareAttempt(t *testing.T) {
+	db, _ := setupRepairRecoveryStore(t)
+	id := "agent-attempt"
+	seedRepairRecoveryState(t, db, id, "running", "awaiting_user", "")
+	requested := time.Now()
+	r := &reviveRuntime{jobID: id, browserMode: reviveBrowserModeAgent, oauthURL: "https://auth.openai.com/oauth/authorize", verificationRequestedAt: requested, queued: []account{{Email: "fixture@example.test"}}}
+	reviveRuntimeState.Lock()
+	reviveRuntimeState.jobs[id] = r
+	reviveRuntimeState.Unlock()
+	old := repairDetectThunderbirdCode
+	calls := 0
+	repairDetectThunderbirdCode = func(email string, cutoff time.Time) (thunderbirdCode, error) {
+		calls++
+		if email != "fixture@example.test" || !cutoff.Equal(requested) {
+			t.Fatal("wrong mailbox attempt")
+		}
+		return thunderbirdCode{Code: "123456", ReceivedAt: requested}, nil
+	}
+	t.Cleanup(func() {
+		repairDetectThunderbirdCode = old
+		reviveRuntimeState.Lock()
+		delete(reviveRuntimeState.jobs, id)
+		reviveRuntimeState.Unlock()
+	})
+	var poll, code map[string]any
+	if err := json.Unmarshal(revivePoll(id).Body, &poll); err != nil {
+		t.Fatal(err)
+	}
+	if poll["automatic"] != false || poll["attempt"] != formatReviveAttempt(requested) {
+		t.Fatal("missing agent attempt")
+	}
+	if err := json.Unmarshal(reviveCode(id, poll["attempt"].(string)).Body, &code); err != nil {
+		t.Fatal(err)
+	}
+	if code["attempt"] != poll["attempt"] || code["code"] != "123456" {
+		t.Fatal("code attempt mismatch")
+	}
+	if err := json.Unmarshal(reviveCode(id, "previous").Body, &code); err != nil {
+		t.Fatal(err)
+	}
+	if code["error"] != "stale_attempt" || calls != 1 {
+		t.Fatal("stale attempt read mailbox")
+	}
 }
 
 func TestReviveFailurePreservesQuarantineAcrossResume(t *testing.T) {

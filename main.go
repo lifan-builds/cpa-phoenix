@@ -317,10 +317,20 @@ func routeManagement(req managementRequest) managementResponse {
 		if !acknowledged(req.Body) {
 			return jsonResponse(400, map[string]string{"error": "acknowledgement_required"})
 		}
-		result, err := beginRevive(req.Headers)
+		browserMode, err := requestedReviveBrowserMode(req.Body)
+		if err != nil {
+			if errors.Is(err, errInvalidBrowserMode) {
+				return jsonResponse(http.StatusBadRequest, map[string]string{"error": "invalid_browser_mode"})
+			}
+			return jsonResponse(http.StatusBadRequest, map[string]string{"error": "bad_request"})
+		}
+		result, err := beginRevive(req.Headers, browserMode)
 		if err != nil {
 			if errors.Is(err, errNoActionableAccounts) {
 				return jsonResponse(http.StatusConflict, map[string]string{"error": "no_actionable_accounts"})
+			}
+			if errors.Is(err, errInvalidBrowserMode) {
+				return jsonResponse(http.StatusBadRequest, map[string]string{"error": "invalid_browser_mode"})
 			}
 			return jsonResponse(409, map[string]string{"error": "job_active"})
 		}
@@ -363,6 +373,16 @@ func acknowledged(raw []byte) bool {
 		Acknowledge string `json:"acknowledge"`
 	}
 	return json.Unmarshal(raw, &v) == nil && v.Acknowledge == "CPA_PHOENIX_ONE_CLICK"
+}
+
+func requestedReviveBrowserMode(raw []byte) (string, error) {
+	var request struct {
+		BrowserMode string `json:"browser_mode"`
+	}
+	if err := json.Unmarshal(raw, &request); err != nil {
+		return "", err
+	}
+	return normalizeReviveBrowserMode(request.BrowserMode)
 }
 func firstQuery(q map[string][]string, k, f string) string {
 	if q == nil || len(q[k]) == 0 {

@@ -25,6 +25,13 @@ var invalidMarkers = []string{
 
 var errNoActionableAccounts = errors.New("no_actionable_accounts")
 
+var errInvalidBrowserMode = errors.New("invalid_browser_mode")
+
+const (
+	reviveBrowserModeAutomatic = "automatic"
+	reviveBrowserModeAgent     = "agent"
+)
+
 // These narrow seams keep the recovery state machine deterministic in offline
 // tests. Production uses the real host inventory, quarantine, callback, and
 // native OAuth implementations; no alternate runtime behavior is registered.
@@ -36,6 +43,7 @@ var (
 	repairStartNativeOAuthMode  = startNativeOAuthMode
 	repairPollNativeOAuth       = pollNativeOAuth
 	repairRefreshQuota          = refreshQuota
+	repairDetectThunderbirdCode = detectThunderbirdCode
 	repairReplacementWaitLimit  = 5 * time.Second
 	repairReplacementPollDelay  = 100 * time.Millisecond
 	repairNewLoginBrowser       = func(ctx context.Context) (loginBrowserController, error) { return newLoginBrowser(ctx) }
@@ -337,16 +345,17 @@ type reviveResponse struct {
 }
 
 type reviveRuntime struct {
-	mu         sync.Mutex
-	jobID      string
-	authHeader string
-	forwarder  *callbackForwarder
-	current    int
-	startAt    int
-	state      string
-	oauthURL   string
-	oauthState string
-	browser    loginBrowserController
+	mu          sync.Mutex
+	jobID       string
+	authHeader  string
+	browserMode string
+	forwarder   *callbackForwarder
+	current     int
+	startAt     int
+	state       string
+	oauthURL    string
+	oauthState  string
+	browser     loginBrowserController
 	// automationStatus is a transient, sanitized controller status. It is never
 	// written to SQLite or logs and intentionally remains visible between OAuth
 	// URL publication and native replacement validation.
@@ -357,6 +366,21 @@ type reviveRuntime struct {
 	queued                  []account
 	started                 bool
 	cancel                  context.CancelFunc
+}
+
+func normalizeReviveBrowserMode(mode string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", reviveBrowserModeAutomatic:
+		return reviveBrowserModeAutomatic, nil
+	case reviveBrowserModeAgent:
+		return reviveBrowserModeAgent, nil
+	default:
+		return "", errInvalidBrowserMode
+	}
+}
+
+func (runtime *reviveRuntime) agentBrowserMode() bool {
+	return runtime != nil && runtime.browserMode == reviveBrowserModeAgent
 }
 
 var reviveRuntimeState = struct {
@@ -390,8 +414,16 @@ func stopAllRevive() {
 	}
 }
 
-func beginRevive(headers map[string][]string) (reviveResponse, error) {
-	if resumed, ok := resumeRevive(headers); ok {
+func beginRevive(headers map[string][]string, requestedMode ...string) (reviveResponse, error) {
+	mode := reviveBrowserModeAutomatic
+	if len(requestedMode) > 0 {
+		mode = requestedMode[0]
+	}
+	mode, err := normalizeReviveBrowserMode(mode)
+	if err != nil {
+		return reviveResponse{}, err
+	}
+	if resumed, ok := resumeRevive(headers, mode); ok {
 		return resumed, nil
 	}
 	accounts, err := repairListAccounts()
@@ -445,7 +477,7 @@ func beginRevive(headers map[string][]string) (reviveResponse, error) {
 			return reviveResponse{}, err
 		}
 	}
-	runtime := &reviveRuntime{jobID: id, authHeader: managementAuthorization(headers), state: "queued", queued: rows}
+	runtime := &reviveRuntime{jobID: id, authHeader: managementAuthorization(headers), browserMode: mode, state: "queued", queued: rows}
 	reviveRuntimeState.Lock()
 	reviveRuntimeState.jobs[id] = runtime
 	reviveRuntimeState.Unlock()
@@ -475,7 +507,15 @@ func captureRepairRows(rows []account) []account {
 	return captured
 }
 
-func resumeRevive(headers map[string][]string) (reviveResponse, bool) {
+func resumeRevive(headers map[string][]string, requestedMode ...string) (reviveResponse, bool) {
+	mode := reviveBrowserModeAutomatic
+	if len(requestedMode) > 0 {
+		mode = requestedMode[0]
+	}
+	mode, err := normalizeReviveBrowserMode(mode)
+	if err != nil {
+		return reviveResponse{}, false
+	}
 	db, err := openStore()
 	if err != nil {
 		return reviveResponse{}, false
@@ -514,7 +554,7 @@ func resumeRevive(headers map[string][]string) (reviveResponse, bool) {
 	for startAt < len(rows) && rows[startAt].RepairState == "repaired" {
 		startAt++
 	}
-	runtime := &reviveRuntime{jobID: id, authHeader: managementAuthorization(headers), state: state, queued: rows, startAt: startAt}
+	runtime := &reviveRuntime{jobID: id, authHeader: managementAuthorization(headers), browserMode: mode, state: state, queued: rows, startAt: startAt}
 	reviveRuntimeState.Lock()
 	reviveRuntimeState.jobs[id] = runtime
 	reviveRuntimeState.Unlock()
@@ -564,28 +604,30 @@ func runReviveQueue(runtime *reviveRuntime) {
 	runtime.cancel = cancel
 	runtime.mu.Unlock()
 	defer cancel()
-	runtime.setAutomationStatus("browser_starting")
-	browser, err := repairNewLoginBrowser(ctx)
-	if err != nil || browser == nil {
-		runtime.setAutomationStatus("browser_unavailable")
-		if runtime.startAt >= 0 && runtime.startAt < len(runtime.queued) {
-			_ = updateRepairRow(runtime.jobID, runtime.startAt+1, "failed", "browser_unavailable")
+	if !runtime.agentBrowserMode() {
+		runtime.setAutomationStatus("browser_starting")
+		browser, err := repairNewLoginBrowser(ctx)
+		if err != nil || browser == nil {
+			runtime.setAutomationStatus("browser_unavailable")
+			if runtime.startAt >= 0 && runtime.startAt < len(runtime.queued) {
+				_ = updateRepairRow(runtime.jobID, runtime.startAt+1, "failed", "browser_unavailable")
+			}
+			updateJob(runtime.jobID, "failed", "browser_unavailable", repairedRowCount(runtime.queued))
+			return
 		}
-		updateJob(runtime.jobID, "failed", "browser_unavailable", repairedRowCount(runtime.queued))
-		return
-	}
-	runtime.mu.Lock()
-	runtime.browser = browser
-	runtime.mu.Unlock()
-	defer func() {
-		_ = browser.Close()
 		runtime.mu.Lock()
-		if runtime.browser == browser {
-			runtime.browser = nil
-		}
+		runtime.browser = browser
 		runtime.mu.Unlock()
-	}()
-	runtime.setAutomationStatus("browser_ready")
+		defer func() {
+			_ = browser.Close()
+			runtime.mu.Lock()
+			if runtime.browser == browser {
+				runtime.browser = nil
+			}
+			runtime.mu.Unlock()
+		}()
+		runtime.setAutomationStatus("browser_ready")
+	}
 	for ordinal := runtime.startAt; ordinal < len(runtime.queued); {
 		if runtime.queued[ordinal].RepairState == "repaired" {
 			ordinal++
@@ -702,11 +744,13 @@ func processReviveRow(ctx context.Context, runtime *reviveRuntime, ordinal int, 
 	}
 	runtime.mu.Lock()
 	browser := runtime.browser
+	agentMode := runtime.agentBrowserMode()
 	runtime.mu.Unlock()
 	// Queue startup owns the browser before any predecessor can be quarantined.
 	// Keep this guard here as well so direct callers cannot mutate an auth file
-	// without a usable automatic controller.
-	if browser == nil {
+	// without a usable automatic controller. Agent mode deliberately leaves
+	// navigation to the caller and therefore has no browser controller.
+	if !agentMode && browser == nil {
 		return "browser_unavailable"
 	}
 	// Own the exact callback port for this row only. A later queued row must
@@ -784,19 +828,21 @@ func processReviveRow(ctx context.Context, runtime *reviveRuntime, ordinal int, 
 	runtime.mu.Lock()
 	runtime.oauthURL, runtime.oauthState = started.URL, started.State
 	runtime.mu.Unlock()
-	attemptCtx, cancelAttempt := context.WithCancel(ctx)
-	browserDone := make(chan struct{})
-	go func() {
-		defer close(browserDone)
-		err := browser.Run(attemptCtx, started.URL, current.Email, expected.AccountID, requestedAt, runtime.setAutomationStatus)
-		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-			runtime.setAutomationStatus(sanitizeAutomationStatus(err.Error()))
-		}
-	}()
-	defer func() {
-		cancelAttempt()
-		<-browserDone
-	}()
+	if !agentMode {
+		attemptCtx, cancelAttempt := context.WithCancel(ctx)
+		browserDone := make(chan struct{})
+		go func() {
+			defer close(browserDone)
+			err := browser.Run(attemptCtx, started.URL, current.Email, expected.AccountID, requestedAt, runtime.setAutomationStatus)
+			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				runtime.setAutomationStatus(sanitizeAutomationStatus(err.Error()))
+			}
+		}()
+		defer func() {
+			cancelAttempt()
+			<-browserDone
+		}()
+	}
 	// The page receives the URL through the transient status response. The raw
 	// URL/state never enter SQLite or logs.
 	if err := setRepairAwaiting(runtime.jobID, ordinal, started.URL); err != nil {
@@ -1041,12 +1087,18 @@ func revivePoll(id string) managementResponse {
 	runtime := reviveRuntimeState.jobs[id]
 	if runtime != nil {
 		runtime.mu.Lock()
+		if runtime.agentBrowserMode() {
+			result["automatic"] = false
+		}
 		if runtime.automationStatus != "" {
 			result["automation_status"] = runtime.automationStatus
 		}
 		if runtime.oauthURL != "" && (snapshot.State == "running" || snapshot.State == "awaiting_user") {
 			result["oauth_url"] = runtime.oauthURL
 			result["awaiting_user"] = snapshot.State == "awaiting_user"
+			if attempt := formatReviveAttempt(runtime.verificationRequestedAt); attempt != "" {
+				result["attempt"] = attempt
+			}
 			if runtime.current >= 0 && runtime.current < len(runtime.queued) {
 				current := runtime.queued[runtime.current]
 				result["email"] = current.Email
@@ -1057,6 +1109,13 @@ func revivePoll(id string) managementResponse {
 	}
 	reviveRuntimeState.Unlock()
 	return jsonResponse(http.StatusOK, result)
+}
+
+func formatReviveAttempt(requestedAt time.Time) string {
+	if requestedAt.IsZero() {
+		return ""
+	}
+	return requestedAt.UTC().Format(time.RFC3339Nano)
 }
 
 func (runtime *reviveRuntime) setAutomationStatus(status string) {
@@ -1084,7 +1143,7 @@ func sanitizeAutomationStatus(status string) string {
 // reviveCode performs a best-effort, read-only lookup for the currently active
 // row. The value is returned only in this response and is never persisted or
 // logged by Phoenix.
-func reviveCode(id string) managementResponse {
+func reviveCode(id string, expectedAttempt ...string) managementResponse {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return jsonResponse(http.StatusBadRequest, map[string]string{"error": "id_required"})
@@ -1111,13 +1170,17 @@ func reviveCode(id string) managementResponse {
 		return jsonResponse(http.StatusConflict, map[string]string{"error": "no_active_row"})
 	}
 	recipient := runtime.queued[ordinal].Email
+	attempt := formatReviveAttempt(requestedAt)
 	runtime.mu.Unlock()
 	reviveRuntimeState.Unlock()
-	code, err := detectThunderbirdCode(recipient, requestedAt)
-	if err != nil {
-		return jsonResponse(http.StatusOK, map[string]any{"job_id": id, "detected": false, "reason": strings.TrimSpace(err.Error())})
+	if len(expectedAttempt) > 0 && strings.TrimSpace(expectedAttempt[0]) != "" && expectedAttempt[0] != attempt {
+		return jsonResponse(http.StatusConflict, map[string]any{"error": "stale_attempt", "job_id": id, "attempt": attempt})
 	}
-	return jsonResponse(http.StatusOK, map[string]any{"job_id": id, "detected": true, "code": code.Code, "received_at": code.ReceivedAt.UTC().Format(time.RFC3339)})
+	code, err := repairDetectThunderbirdCode(recipient, requestedAt)
+	if err != nil {
+		return jsonResponse(http.StatusOK, map[string]any{"job_id": id, "attempt": attempt, "detected": false, "reason": strings.TrimSpace(err.Error())})
+	}
+	return jsonResponse(http.StatusOK, map[string]any{"job_id": id, "attempt": attempt, "detected": true, "code": code.Code, "received_at": code.ReceivedAt.UTC().Format(time.RFC3339)})
 }
 
 func cancelRevive(id string, headers map[string][]string) bool {
