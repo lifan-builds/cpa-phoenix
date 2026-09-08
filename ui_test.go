@@ -6,18 +6,18 @@ import (
 	"testing"
 )
 
-func TestDashboardHasExactlyTwoActions(t *testing.T) {
-	if strings.Count(dashboardHTML, "<button") != 2 {
-		t.Fatal("dashboard must have exactly two buttons")
+func TestDashboardHasMaintenanceActionsAndScheduleSave(t *testing.T) {
+	if strings.Count(dashboardHTML, "<button") != 3 {
+		t.Fatal("dashboard must have two maintenance buttons and schedule save")
 	}
-	if strings.Count(string(dashboardPageHTML()), "<button") != 2 {
-		t.Fatal("enhanced dashboard must retain exactly two buttons")
+	if strings.Count(string(dashboardPageHTML()), "<button") != 3 {
+		t.Fatal("dashboard must retain schedule save")
 	}
 	dashboard := string(dashboardPageHTML())
 	if strings.Count(dashboard, "<script>") != 1 || strings.Count(dashboard, "async function scan()") != 1 || strings.Count(dashboard, "async function run(kind)") != 1 || strings.Count(dashboard, "async function poll(id,revive=false)") != 1 {
 		t.Fatal("rendered dashboard must have one authoritative script")
 	}
-	for _, forbidden := range []string{"account picker", "scheduler", "analytics", "export"} {
+	for _, forbidden := range []string{"account picker", "analytics", "export"} {
 		if strings.Contains(strings.ToLower(dashboardHTML), forbidden) {
 			t.Fatalf("dashboard contains forbidden %q", forbidden)
 		}
@@ -201,5 +201,43 @@ global.window={};global.setTimeout=()=>{};
 `
 	if out, err := exec.Command("node", "-e", harness).CombinedOutput(); err != nil {
 		t.Fatalf("agent code handoff failed: %v\n%s", err, out)
+	}
+}
+
+func TestDashboardScheduleSaveAndFailedSavePreserveInputs(t *testing.T) {
+	script := strings.Split(strings.Split(dashboardHTML, "<script>")[1], "</script>")[0]
+	script = strings.Replace(script, "\nscan()\n", "\n", 1)
+	harness := `
+const assert=require('node:assert/strict'),elements=new Map();
+global.document={querySelector(s){if(!elements.has(s))elements.set(s,{value:'',checked:false,textContent:'',classList:{add(){},remove(){}},setAttribute(k,v){this[k]=v},removeAttribute(k){delete this[k]}});return elements.get(s)}};
+global.window={};global.setTimeout=()=>{};
+` + script + `
+(async()=>{
+  const initial={enabled:false,time:'09:00',timezone:'America/Los_Angeles',next_run:0,last_run:0};
+  authenticatedFetch=async()=>({ok:true,json:async()=>initial});
+  await loadIgniteSchedule();
+  assert.match(document.querySelector('#schedule-status').textContent,/off/);
+  document.querySelector('#schedule-enabled').checked=true;
+  document.querySelector('#schedule-time').value='08:30';
+  document.querySelector('#ignite-schedule').oninput();
+  await loadIgniteSchedule();
+  assert.equal(document.querySelector('#schedule-time').value,'08:30','refresh must preserve unsaved edits');
+  post=async(path,body)=>{
+    assert.equal(path,'ignite/schedule');assert.equal(body.enabled,true);assert.equal(body.time,'08:30');
+    assert.equal(body.timezone,'America/Los_Angeles');assert.equal(body.acknowledge,'CPA_PHOENIX_ONE_CLICK');
+    return {...body,next_run:1800000000,last_run:0};
+  };
+  await saveIgniteSchedule({preventDefault(){}});
+  assert.match(document.querySelector('#schedule-status').textContent,/Next run/);
+  post=async()=>{throw Error('offline')};
+  document.querySelector('#schedule-time').value='10:00';
+  await saveIgniteSchedule({preventDefault(){}});
+  assert.equal(document.querySelector('#schedule-time').value,'10:00');
+  assert.equal(document.querySelector('#schedule-save').disabled,false);
+  assert.match(document.querySelector('#schedule-status').textContent,/Could not save/);
+})().catch(e=>{console.error(e);process.exitCode=1});
+`
+	if out, err := exec.Command("node", "-e", harness).CombinedOutput(); err != nil {
+		t.Fatalf("schedule dashboard failed: %v\n%s", err, out)
 	}
 }

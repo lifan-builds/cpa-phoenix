@@ -87,6 +87,16 @@ CREATE TABLE IF NOT EXISTS repair_rows (
  reason TEXT NOT NULL DEFAULT '',
  quarantine TEXT NOT NULL DEFAULT '',
  PRIMARY KEY(job_id,ordinal)
+);
+CREATE TABLE IF NOT EXISTS ignite_schedule (
+ id INTEGER PRIMARY KEY CHECK(id=1),
+ enabled INTEGER NOT NULL DEFAULT 0,
+ time TEXT NOT NULL DEFAULT '09:00',
+ timezone TEXT NOT NULL DEFAULT 'America/Los_Angeles',
+ next_run INTEGER NOT NULL DEFAULT 0,
+ last_run INTEGER NOT NULL DEFAULT 0,
+ last_job_id TEXT NOT NULL DEFAULT '',
+ last_outcome TEXT NOT NULL DEFAULT ''
 );`); err != nil {
 		db.Close()
 		return nil, err
@@ -104,6 +114,9 @@ CREATE TABLE IF NOT EXISTS repair_rows (
 	_, _ = db.Exec(`ALTER TABLE repair_rows ADD COLUMN auth_path TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`ALTER TABLE repair_rows ADD COLUMN auth_dir TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`ALTER TABLE repair_rows ADD COLUMN quarantine TEXT NOT NULL DEFAULT ''`)
+	// The scheduler has exactly one persisted configuration. Keep its row
+	// present so GET has stable defaults even before the first dashboard save.
+	_, _ = db.Exec(`INSERT INTO ignite_schedule(id,enabled,time,timezone,next_run,last_run,last_job_id,last_outcome) VALUES(1,0,'09:00','America/Los_Angeles',0,0,'','') ON CONFLICT(id) DO NOTHING`)
 	// Older Phoenix builds briefly persisted absolute auth paths to resume a
 	// repair. Paths are runtime-only now; queued rows resolve their current
 	// exact file from host.auth.list and quarantined rows no longer need the
@@ -120,6 +133,10 @@ CREATE TABLE IF NOT EXISTS repair_rows (
 	_, _ = db.Exec(`UPDATE activation_cycles SET status='sent_unknown',updated_at=? WHERE status='dispatch_intent'`, time.Now().Unix())
 	_, _ = db.Exec(`UPDATE jobs SET state='completed',reason='interrupted',updated_at=? WHERE kind='ignite' AND state IN ('running','awaiting_user')`, time.Now().Unix())
 	_, _ = db.Exec(`UPDATE jobs SET state='failed',reason='interrupted',updated_at=? WHERE kind='revive' AND state IN ('running','awaiting_user')`, time.Now().Unix())
+	// A process can stop after the scheduler records a job ID but before the
+	// worker publishes its terminal outcome. Reconcile that projection with the
+	// durable job cleanup above so a restart never leaves "running" forever.
+	_, _ = db.Exec(`UPDATE ignite_schedule SET last_outcome='interrupted' WHERE id=1 AND last_outcome='running' AND last_job_id<>'' AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.id=ignite_schedule.last_job_id AND jobs.state IN ('running','awaiting_user'))`)
 	_ = os.Chmod(path, 0600)
 	storeDB = db
 	return db, nil
@@ -326,7 +343,7 @@ func (m *jobManager) start(kind string, total int) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.active != "" {
-		return "", errors.New("job already active")
+		return "", errIgniteJobActive
 	}
 	db, err := openStore()
 	if err != nil {
@@ -337,7 +354,7 @@ func (m *jobManager) start(kind string, total int) (string, error) {
 		return "", err
 	}
 	if existing > 0 {
-		return "", errors.New("job already active")
+		return "", errIgniteJobActive
 	}
 	id := time.Now().UTC().Format("20060102T150405.000000000Z")
 	now := time.Now().Unix()

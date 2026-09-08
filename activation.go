@@ -327,6 +327,13 @@ var minimalRequest = []byte(`{"model":"gpt-5.5","instructions":"Reply with OK.",
 // memory for the duration of the call.
 var upstreamRequest = defaultUpstreamRequest
 
+// Keep inventory injectable at the job boundary. The production path still
+// uses the host inventory, while schedule tests can exercise the complete
+// worker without invoking a live CPA installation.
+var igniteListAccounts = listAccounts
+
+var errIgniteJobActive = errors.New("job_active")
+
 const codexCompactURL = "https://chatgpt.com/backend-api/codex/responses/compact"
 
 var codexCompactURLForTest string
@@ -373,6 +380,70 @@ func doCompactRequest(ctx context.Context, a account, body []byte) (int, []byte,
 	defer resp.Body.Close()
 	responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	return resp.StatusCode, responseBody, nil
+}
+
+type igniteResponse struct {
+	JobID string `json:"job_id"`
+	State string `json:"state"`
+	Total int    `json:"total"`
+}
+
+// beginIgnite owns the common preflight, durable action gate, and worker
+// launch used by both the management action and the daily scheduler. The
+// optional scheduled flag lets the worker publish terminal status back to the
+// persisted schedule before it is launched, avoiding a completion race for
+// very small fixture jobs.
+func beginIgnite(scheduled ...bool) (igniteResponse, error) {
+	accounts, err := igniteListAccounts()
+	if err != nil {
+		return igniteResponse{}, err
+	}
+	if countFreshActionable(accounts, timeNow()) == 0 {
+		return igniteResponse{}, errNoActionableAccounts
+	}
+	id, err := globalJobs.start("ignite", len(accounts))
+	if err != nil {
+		if errors.Is(err, errIgniteJobActive) || strings.Contains(err.Error(), "job already active") {
+			return igniteResponse{}, errIgniteJobActive
+		}
+		return igniteResponse{}, err
+	}
+	isScheduled := len(scheduled) > 0 && scheduled[0]
+	if isScheduled {
+		// Persist the attempted run before starting its goroutine. This leaves a
+		// useful last_job_id even if the worker exits before its first callback.
+		markIgniteScheduleStarted(id, timeNow().Unix())
+	}
+	go runIgniteJob(id, isScheduled)
+	return igniteResponse{JobID: id, State: "running", Total: len(accounts)}, nil
+}
+
+func runIgniteJob(id string, scheduled bool) {
+	ctx := globalJobs.context(id)
+	current, inventoryErr := igniteListAccounts()
+	if inventoryErr != nil {
+		updateJob(id, "completed", "inventory_unavailable", 0)
+		if scheduled {
+			finishIgniteSchedule(id, "failed")
+		}
+		return
+	}
+	if db, dbErr := openStore(); dbErr == nil {
+		_, _ = db.Exec(`UPDATE jobs SET total=?,updated_at=? WHERE id=?`, len(current), time.Now().Unix(), id)
+	}
+	result := ignite(ctx, current, timeNow())
+	updateJobResult(id, result)
+	if ctx.Err() != nil {
+		updateJob(id, "cancelled", "cancelled", len(current))
+		if scheduled {
+			finishIgniteSchedule(id, "cancelled")
+		}
+	} else {
+		updateJob(id, "completed", "", len(current))
+		if scheduled {
+			finishIgniteSchedule(id, "completed")
+		}
+	}
 }
 
 func shouldRetryMinimal(status int, body []byte) bool {

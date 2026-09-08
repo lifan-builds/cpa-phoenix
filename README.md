@@ -56,11 +56,22 @@ finish that step in Phoenix's Chrome window. Successful OAuth and a quota
 probe remain the authority for marking a workspace repaired. Each login
 attempt has a five-minute timeout; an interrupted queue can be resumed.
 
-This source targets CPA plugin ABI v1 and Go 1.21. It has no scheduler, usage
-handler, pricing downloader, analytics, account picker, or background timer;
-there is no automatic trigger. The source is version 0.1.0. Installation,
-authentication, and upstream traffic remain explicit operator-controlled
-actions and are never initiated by a source build.
+## Daily Ignite
+
+In the Ignite card, enable **Ignite automatically every day**, choose a time
+and IANA time zone (for example `America/Los_Angeles`), then **Save schedule**.
+The dashboard shows the next run and the last scheduled attempt. Disable the
+checkbox and save to turn scheduling off. New installations default to off.
+
+The schedule is stored in Phoenix's SQLite state and runs inside CPA, without
+an agent or open dashboard. CPA and the computer must be running; after sleep
+or downtime, Phoenix catches up one missed run rather than replaying each day.
+If another maintenance job is active, scheduled Ignite waits for it. Scheduled
+and manual Ignite use the same fresh-account checks and per-cycle deduplication.
+Saving a schedule does not perform an immediate Ignite.
+
+This source targets CPA plugin ABI v1 and Go 1.21. The source is version 0.1.0.
+Source builds never initiate authentication or upstream traffic.
 
 Email-code logins can complete unattended while Thunderbird is receiving mail.
 Other verification challenges may still require your interaction.
@@ -95,6 +106,6 @@ is included.
 ## Local installation
 
 Run `./build.sh`, copy `cpa-phoenix.dylib` into CPA's configured plugin
-directory for the current platform, and restart CPA. Phoenix has no background
-schedule; Ignite and Revive run only from its Management page. Quarantined auth
-files are not restored automatically.
+directory for the current platform, and restart CPA. Saved daily Ignite
+schedules resume with CPA. Revive remains manually started from Management.
+Quarantined auth files are not restored automatically.

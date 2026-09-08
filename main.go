@@ -145,7 +145,12 @@ func cliproxyPluginFree(ptr unsafe.Pointer, _ C.size_t) {
 }
 
 //export cliproxyPluginShutdown
-func cliproxyPluginShutdown() { stopAllRevive(); globalJobs.stop(); closeStore() }
+func cliproxyPluginShutdown() {
+	stopIgniteScheduler()
+	stopAllRevive()
+	globalJobs.stop()
+	closeStore()
+}
 
 func writeResponse(out *C.cliproxy_buffer, raw []byte) {
 	if out == nil {
@@ -210,9 +215,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		if len(request) > 0 && json.Unmarshal(request, &ignored) != nil {
 			return nil, errors.New("invalid lifecycle request")
 		}
+		startIgniteScheduler()
 		return okJSON(pluginRegisterResponse{SchemaVersion: 1, Metadata: pluginMetadata{Name: "CPA Phoenix", Version: pluginVersion, Author: "lifan-builds", GitHubRepository: "https://github.com/lifan-builds/cpa-phoenix"}, Capabilities: capabilities{ManagementAPI: true}}), nil
 	case "management.register":
-		return okJSON(managementRegistrationResponse{Routes: []managementRoute{{"POST", "/plugins/cpa-phoenix/scan", "Refresh sanitized account counts."}, {"GET", "/plugins/cpa-phoenix/state", "Read sanitized job state."}, {"POST", "/plugins/cpa-phoenix/ignite", "Ignite all fresh accounts once."}, {"POST", "/plugins/cpa-phoenix/revive", "Revive all invalid accounts sequentially."}, {"POST", "/plugins/cpa-phoenix/revive/poll", "Advance the guided repair."}, {"POST", "/plugins/cpa-phoenix/revive/code", "Read a fresh verification code from Thunderbird."}, {"POST", "/plugins/cpa-phoenix/revive/cancel", "Cancel the guided repair."}}, Resources: []resourceRoute{{"/dashboard", "Phoenix", "Fresh-account activation and invalid-auth repair."}}}), nil
+		return okJSON(managementRegistrationResponse{Routes: []managementRoute{{"POST", "/plugins/cpa-phoenix/scan", "Refresh sanitized account counts."}, {"GET", "/plugins/cpa-phoenix/state", "Read sanitized job state."}, {"POST", "/plugins/cpa-phoenix/ignite", "Ignite all fresh accounts once."}, {"GET", "/plugins/cpa-phoenix/ignite/schedule", "Read the daily Ignite schedule."}, {"POST", "/plugins/cpa-phoenix/ignite/schedule", "Configure the daily Ignite schedule."}, {"POST", "/plugins/cpa-phoenix/revive", "Revive all invalid accounts sequentially."}, {"POST", "/plugins/cpa-phoenix/revive/poll", "Advance the guided repair."}, {"POST", "/plugins/cpa-phoenix/revive/code", "Read a fresh verification code from Thunderbird."}, {"POST", "/plugins/cpa-phoenix/revive/cancel", "Cancel the guided repair."}}, Resources: []resourceRoute{{"/dashboard", "Phoenix", "Fresh-account activation and invalid-auth repair."}}}), nil
 	case "management.handle":
 		var req managementRequest
 		if err := json.Unmarshal(request, &req); err != nil {
@@ -279,40 +285,24 @@ func routeManagement(req managementRequest) managementResponse {
 			rows = append(rows, map[string]any{"number": len(rows) + 1, "email": a.Email, "seat": stableSeatLabel(a), "status": status, "quota": quotaState})
 		}
 		return jsonResponse(200, map[string]any{"fresh": fresh, "invalid": invalid, "active": anyJobActive(), "active_job": activeJobProjection(), "last_job": latestJobProjection(), "accounts": rows, "repair_queue": incompleteRepairQueue()})
+	case path == "/ignite/schedule":
+		return handleIgniteScheduleManagement(req)
 	case path == "/ignite" && req.Method == http.MethodPost:
 		if !acknowledged(req.Body) {
 			return jsonResponse(400, map[string]string{"error": "acknowledgement_required"})
 		}
-		accounts, err := listAccounts()
+		result, err := beginIgnite()
 		if err != nil {
-			return jsonResponse(503, map[string]string{"error": "inventory_unavailable"})
-		}
-		if countFreshActionable(accounts, timeNow()) == 0 {
-			return jsonResponse(http.StatusConflict, map[string]string{"error": "no_actionable_accounts"})
-		}
-		id, err := globalJobs.start("ignite", len(accounts))
-		if err != nil {
-			return jsonResponse(409, map[string]string{"error": "job_active"})
-		}
-		go func() {
-			ctx := globalJobs.context(id)
-			current, inventoryErr := listAccounts()
-			if inventoryErr != nil {
-				updateJob(id, "completed", "inventory_unavailable", 0)
-				return
+			switch {
+			case errors.Is(err, errNoActionableAccounts):
+				return jsonResponse(http.StatusConflict, map[string]string{"error": "no_actionable_accounts"})
+			case errors.Is(err, errIgniteJobActive):
+				return jsonResponse(http.StatusConflict, map[string]string{"error": "job_active"})
+			default:
+				return jsonResponse(http.StatusServiceUnavailable, map[string]string{"error": "inventory_unavailable"})
 			}
-			if db, dbErr := openStore(); dbErr == nil {
-				_, _ = db.Exec(`UPDATE jobs SET total=?,updated_at=? WHERE id=?`, len(current), time.Now().Unix(), id)
-			}
-			result := ignite(ctx, current, timeNow())
-			updateJobResult(id, result)
-			if ctx.Err() != nil {
-				updateJob(id, "cancelled", "cancelled", len(accounts))
-			} else {
-				updateJob(id, "completed", "", len(current))
-			}
-		}()
-		return jsonResponse(202, map[string]any{"job_id": id, "state": "running"})
+		}
+		return jsonResponse(202, result)
 	case path == "/revive" && req.Method == http.MethodPost:
 		if !acknowledged(req.Body) {
 			return jsonResponse(400, map[string]string{"error": "acknowledgement_required"})
