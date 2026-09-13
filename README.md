@@ -26,7 +26,9 @@ waits a short bounded interval for replacement propagation. A later resume
 also reconciles an already-healthy replacement without starting OAuth again.
 An obsolete record is moved to owner-only quarantine before login and is not
 restored automatically. The callback forwarder is temporary and binds only to
-`127.0.0.1:1455`. During login, Phoenix enters a fresh matching OpenAI
+`127.0.0.1:1455`; an exact `localhost:1455` redirect from native CPA is
+normalized to that IPv4 loopback so Chrome cannot fall onto an unavailable
+IPv6 localhost listener. During login, Phoenix enters a fresh matching OpenAI
 verification code from the account's Thunderbird mailbox; entering a code
 manually in the Chrome window follows the same repair flow.
 

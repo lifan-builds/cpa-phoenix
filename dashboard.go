@@ -33,7 +33,7 @@ const dashboardHTML = `<!doctype html>
     </main>
     <section class="schedule-panel"><details><summary><span class="schedule-icon" aria-hidden="true">◷</span><div><strong>Daily Ignite schedule</strong><small id="schedule-summary">Set a daily time to activate fresh accounts automatically.</small></div><span class="disclosure" aria-hidden="true">⌄</span></summary><form id="ignite-schedule"><label class="option"><input id="schedule-enabled" type="checkbox"> Ignite automatically every day</label><div class="schedule-fields"><div class="field"><label for="schedule-time">Daily time</label><input id="schedule-time" type="time" value="09:00" required></div><div class="field"><label for="schedule-timezone">Time zone</label><input id="schedule-timezone" type="text" value="America/Los_Angeles" required spellcheck="false" aria-describedby="timezone-help"></div><button id="schedule-save" type="submit" disabled>Save schedule</button></div><p id="schedule-status" role="status" aria-live="polite">Loading schedule…</p><p class="schedule-help" id="timezone-help">Use an IANA time zone, such as America/Los_Angeles. Runs while CPA is running, even with this page closed. After sleep or downtime, one missed run is caught up. Only fresh accounts are ignited.</p></form></details></section>
     <div class="activity"><strong>Activity</strong><p id="status" role="status" aria-live="polite">Scanning accounts…</p></div>
-    <div id="agent-login" hidden><a id="current-login" target="_blank" rel="noopener noreferrer">Open current login</a><label>Verification code <input id="verification-code" readonly autocomplete="off"></label><span id="verification-state" role="status"></span></div>
+    <div id="agent-login" hidden><a id="current-login" target="_blank" rel="noopener noreferrer">Open current login</a><p id="workspace-help" role="note">Choose the exact workspace matching the target seat; never select Personal.</p><label>Verification code <input id="verification-code" readonly autocomplete="off"></label><span id="verification-state" role="status"></span></div>
     <section class="inventory" aria-labelledby="inventory-title"><div class="inventory-head"><div><h2 id="inventory-title">Account status</h2><p>Access and quota status across your workspaces.</p></div><div class="filters"><input id="account-search" type="search" placeholder="Search email or workspace…" aria-label="Search accounts by email or workspace"><select id="account-filter" aria-label="Filter accounts"><option value="all">All accounts</option><option value="healthy">Healthy</option><option value="invalid">Invalid</option><option value="fresh">Fresh quota</option></select></div></div><div id="accounts"><div class="empty-state">Loading account inventory…</div></div><div class="inventory-foot" id="account-results" role="status" aria-live="polite">Waiting for CPA…</div></section>
     <footer><span>CPA Phoenix · Account maintenance center</span><span id="scan-time">Counts are verified before actions are enabled.</span></footer>
   </div>
@@ -280,16 +280,24 @@ function phoenixClearAgentLogin(){
   document.querySelector('#verification-code').value='';
 }
 function phoenixShowAgentLogin(result){
-  const url=new URL(result.oauth_url);
-  if(url.origin!=='https://auth.openai.com'||url.username||url.password)throw Error('oauth_url_invalid');
+  // Native CPA may cross one HTML serialization boundary before the URL
+  // reaches this page. Decode exactly one layer at the final navigation
+  // boundary as a defense-in-depth measure. Keep the fragment opaque: native
+  // URLs can legitimately contain a nested entity there, and decoding it a
+  // second time would change the signed URL bytes.
+  const rawOAuthURL=String(result.oauth_url||''),fragmentAt=rawOAuthURL.indexOf('#');
+  const oauthURL=(fragmentAt<0?rawOAuthURL.slice(0):rawOAuthURL.slice(0,fragmentAt)).replaceAll('&amp;','&')+(fragmentAt<0?'':rawOAuthURL.slice(fragmentAt));
+  const url=new URL(oauthURL);
+  if(url.origin!=='https://auth.openai.com'||url.username||url.password||[...url.searchParams.keys()].some(key=>key.startsWith('amp;')))throw Error('oauth_url_invalid');
   if(phoenixAttempt!==result.attempt){
     phoenixAttempt=result.attempt;
     document.querySelector('#verification-code').value='';
     document.querySelector('#verification-state').textContent='Waiting for fresh mail…';
   }
   const link=document.querySelector('#current-login');
-  link.setAttribute('href',result.oauth_url);
+  link.setAttribute('href',oauthURL);
   link.textContent='Open current login · '+String(result.email||'')+' · '+String(result.seat||'');
+  document.querySelector('#workspace-help').textContent='Target workspace seat: '+String(result.seat||'unknown')+'. Choose the exact matching workspace ID; never select Personal.';
   document.querySelector('#agent-login').setAttribute('data-attempt',result.attempt);
   document.querySelector('#agent-login').hidden=false;
 }

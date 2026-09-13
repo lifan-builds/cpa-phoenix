@@ -35,3 +35,22 @@ phoenixRenderAccounts([],[]);assert.match(accounts.innerHTML,/No accounts found/
 		t.Fatalf("dashboard filtering failed: %v\n%s", err, out)
 	}
 }
+
+func TestDashboardNormalizesOAuthURLAtNavigationBoundary(t *testing.T) {
+	script := strings.Split(strings.Split(dashboardHTML, "<script>")[1], "</script>")[0]
+	script = strings.Replace(script, "\nscan()\n", "\n", 1)
+	harness := `
+const assert=require('node:assert/strict'),elements=new Map();
+global.document={querySelector(s){if(!elements.has(s))elements.set(s,{value:'',textContent:'',hidden:false,setAttribute(k,v){this[k]=v},removeAttribute(k){delete this[k]},classList:{add(){},remove(){}}});return elements.get(s)}};
+` + script + `
+phoenixShowAgentLogin({oauth_url:'https://auth.openai.com/authorize?client_id=x&amp;state=s',attempt:'one',email:'seat@example.test',seat:'seat-12345678'});
+assert.equal(document.querySelector('#current-login').href,'https://auth.openai.com/authorize?client_id=x&state=s');
+assert.match(document.querySelector('#workspace-help').textContent,/seat-12345678/);
+phoenixShowAgentLogin({oauth_url:'https://auth.openai.com/authorize?client_id=x&amp;state=s#nested&amp;fragment',attempt:'two',email:'seat@example.test',seat:'seat-12345678'});
+assert.equal(document.querySelector('#current-login').href,'https://auth.openai.com/authorize?client_id=x&state=s#nested&amp;fragment');
+assert.throws(()=>phoenixShowAgentLogin({oauth_url:'https://auth.openai.com/authorize?amp;client_id=x',attempt:'two',email:'seat@example.test',seat:'seat-12345678'}),/oauth_url_invalid/);
+`
+	if out, err := exec.Command("node", "-e", harness).CombinedOutput(); err != nil {
+		t.Fatalf("dashboard OAuth boundary normalization failed: %v\n%s", err, out)
+	}
+}

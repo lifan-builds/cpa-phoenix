@@ -85,6 +85,20 @@ func TestComposeOAuthURLModePrefillEscapesPlusEmail(t *testing.T) {
 	}
 }
 
+func TestComposeOAuthURLModeNormalizesLocalhostCallback(t *testing.T) {
+	raw := "https://login.example.test/authorize?client_id=x&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&state=s"
+	got, err := composeOAuthURLMode(raw, "seat@example.test", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback") {
+		t.Fatalf("localhost callback must target Phoenix's IPv4 listener: %q", got)
+	}
+	if strings.Contains(got, "redirect_uri=http%3A%2F%2Flocalhost%3A1455") {
+		t.Fatalf("localhost callback was not normalized: %q", got)
+	}
+}
+
 func TestComposeOAuthURLSelectsAccountForDuplicateEmailSeats(t *testing.T) {
 	raw := "https://login.example.test/authorize?client_id=x&login_hint=old%40example.test&prompt=login&state=s"
 	got, err := composeOAuthURLMode(raw, "same@example.test", true)

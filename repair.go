@@ -209,8 +209,9 @@ func composeOAuthURLMode(raw, email string, selectAccount bool) (string, error) 
 	}
 	// Validate and edit only query-field boundaries. Reconstructing through
 	// url.Values would reorder fields and normalize PKCE/redirect escapes, so
-	// preserve every retained segment byte-for-byte and append the two Butler
-	// prefill fields at the end.
+	// preserve every retained segment byte-for-byte (apart from the narrowly
+	// normalized loopback callback below) and append the two Butler prefill
+	// fields at the end.
 	fragmentAt := strings.IndexByte(raw, '#')
 	withoutFragment := raw
 	fragment := ""
@@ -242,11 +243,31 @@ func composeOAuthURLMode(raw, email string, selectAccount bool) (string, error) 
 			}
 			// Validate escaped values without using their decoded form in the
 			// output; this catches malformed native URLs while preserving bytes.
-			if _, valueErr := url.QueryUnescape(segment); valueErr != nil {
+			valueRaw := ""
+			if equalsAt := strings.IndexByte(segment, '='); equalsAt >= 0 {
+				valueRaw = segment[equalsAt+1:]
+			}
+			value, valueErr := url.QueryUnescape(valueRaw)
+			if valueErr != nil {
 				return "", errors.New("oauth_url_invalid")
 			}
 			if key == "login_hint" || key == "prompt" {
 				continue
+			}
+			// Phoenix owns an IPv4-only callback listener. Some native CPA
+			// responses advertise localhost, which can resolve to ::1 in Chrome
+			// and yield a connection-refused callback even though 127.0.0.1 is
+			// listening. Normalize only this exact callback URI; all other native
+			// query bytes remain untouched.
+			if key == "redirect_uri" {
+				if redirect, redirectErr := url.Parse(value); redirectErr == nil &&
+					strings.EqualFold(redirect.Scheme, "http") &&
+					strings.EqualFold(redirect.Hostname(), "localhost") &&
+					redirect.Port() == "1455" && redirect.Path == "/auth/callback" && redirect.RawQuery == "" && redirect.Fragment == "" {
+					equalsAt := strings.IndexByte(segment, '=')
+					redirect.Host = "127.0.0.1:1455"
+					segment = segment[:equalsAt+1] + url.QueryEscape(redirect.String())
+				}
 			}
 			kept = append(kept, segment)
 		}
