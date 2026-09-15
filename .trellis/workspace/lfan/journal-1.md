@@ -49,3 +49,25 @@ Preserved native CPA redirect_uri localhost semantics and hardened Phoenix provi
 ### Status
 
 [OK] **Completed**
+
+
+## Session 3: Harden Phoenix repair skill
+<!-- trellis-session: v=2 fp=8e87a6784a626146 -->
+
+**Date**: 2026-09-15
+**Task**: Harden Phoenix repair skill
+**Branch**: `main`
+
+### Summary
+
+Expanded the project-local Phoenix repair skill with deterministic queue ownership, stale-attempt checks, provider-auth and challenge handling, exact-seat absence behavior, quarantine-safe resume rules, and end-to-end completion evidence. Verified Go tests, race tests, vet, shell syntax, and diff checks; no runtime code or account state changed.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `3a70620` | docs: harden Phoenix repair skill |
+
+### Status
+
+[OK] **Completed**
