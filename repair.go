@@ -97,7 +97,11 @@ type callbackForwarder struct {
 var nativeCallbackTarget = "http://127.0.0.1:8317/codex/callback"
 
 func bindCallbackForwarder() (*callbackForwarder, error) {
-	ln, err := net.Listen("tcp4", "127.0.0.1:1455")
+	// Keep CPA's registered OAuth redirect URI byte-for-byte intact. The native
+	// flow uses localhost, and the provider rejects a rewritten 127.0.0.1 URI.
+	// Listening on localhost lets the platform select the same loopback family
+	// that the browser uses for that native callback.
+	ln, err := net.Listen("tcp", "localhost:1455")
 	if err != nil {
 		return nil, errors.New("callback_port_unavailable")
 	}
@@ -247,28 +251,15 @@ func composeOAuthURLMode(raw, email string, selectAccount bool) (string, error) 
 			if equalsAt := strings.IndexByte(segment, '='); equalsAt >= 0 {
 				valueRaw = segment[equalsAt+1:]
 			}
-			value, valueErr := url.QueryUnescape(valueRaw)
-			if valueErr != nil {
+			if _, valueErr := url.QueryUnescape(valueRaw); valueErr != nil {
 				return "", errors.New("oauth_url_invalid")
 			}
 			if key == "login_hint" || key == "prompt" {
 				continue
 			}
-			// Phoenix owns an IPv4-only callback listener. Some native CPA
-			// responses advertise localhost, which can resolve to ::1 in Chrome
-			// and yield a connection-refused callback even though 127.0.0.1 is
-			// listening. Normalize only this exact callback URI; all other native
-			// query bytes remain untouched.
-			if key == "redirect_uri" {
-				if redirect, redirectErr := url.Parse(value); redirectErr == nil &&
-					strings.EqualFold(redirect.Scheme, "http") &&
-					strings.EqualFold(redirect.Hostname(), "localhost") &&
-					redirect.Port() == "1455" && redirect.Path == "/auth/callback" && redirect.RawQuery == "" && redirect.Fragment == "" {
-					equalsAt := strings.IndexByte(segment, '=')
-					redirect.Host = "127.0.0.1:1455"
-					segment = segment[:equalsAt+1] + url.QueryEscape(redirect.String())
-				}
-			}
+			// Do not rewrite redirect_uri. OAuth providers validate the exact
+			// registered URI; CPA's native flow advertises localhost and Phoenix
+			// now listens on that same loopback name.
 			kept = append(kept, segment)
 		}
 	}
@@ -849,20 +840,33 @@ func processReviveRow(ctx context.Context, runtime *reviveRuntime, ordinal int, 
 	runtime.mu.Lock()
 	runtime.oauthURL, runtime.oauthState = started.URL, started.State
 	runtime.mu.Unlock()
+	providerAuthError := func() bool { return false }
 	if !agentMode {
 		attemptCtx, cancelAttempt := context.WithCancel(ctx)
 		browserDone := make(chan struct{})
+		browserResult := make(chan error, 1)
 		go func() {
 			defer close(browserDone)
 			err := browser.Run(attemptCtx, started.URL, current.Email, expected.AccountID, requestedAt, runtime.setAutomationStatus)
 			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 				runtime.setAutomationStatus(sanitizeAutomationStatus(err.Error()))
 			}
+			browserResult <- err
 		}()
 		defer func() {
 			cancelAttempt()
 			<-browserDone
 		}()
+		// Keep the result channel scoped to this attempt. A browser result from a
+		// prior row must never become a terminal reason for the next row.
+		providerAuthError = func() bool {
+			select {
+			case browserErr := <-browserResult:
+				return browserErr != nil && strings.TrimSpace(browserErr.Error()) == "provider_auth_error"
+			default:
+				return false
+			}
+		}
 	}
 	// The page receives the URL through the transient status response. The raw
 	// URL/state never enter SQLite or logs.
@@ -871,12 +875,18 @@ func processReviveRow(ctx context.Context, runtime *reviveRuntime, ordinal int, 
 	}
 	deadline := time.Now().Add(5 * time.Minute)
 	for {
+		if providerAuthError() {
+			return "provider_auth_error"
+		}
 		if time.Now().After(deadline) {
 			return "oauth_timeout"
 		}
 		status, err := repairPollNativeOAuth(ctx, runtime.authHeader, started.State)
 		if err != nil {
 			return "oauth_poll_failed"
+		}
+		if providerAuthError() {
+			return "provider_auth_error"
 		}
 		switch status {
 		case "wait":
@@ -895,6 +905,9 @@ func processReviveRow(ctx context.Context, runtime *reviveRuntime, ordinal int, 
 						return "repaired"
 					}
 				}
+			}
+			if providerAuthError() {
+				return "provider_auth_error"
 			}
 			select {
 			case <-ctx.Done():
@@ -1154,7 +1167,7 @@ func sanitizeAutomationStatus(status string) string {
 	case "browser_starting", "browser_ready", "browser_unavailable", "browser_navigation_failed", "browser_automation_failed", "oauth_url_invalid",
 		"login_opened", "email_submitted", "email_code_requested", "verification_code_waiting", "verification_code_submitted", "verification_code_resent",
 		"workspace_selected", "manual_workspace_selection_required", "manual_password_required", "manual_captcha_required",
-		"manual_login_required", "manual_recipient_mismatch", "callback_reached", "login_window_closed":
+		"manual_login_required", "manual_recipient_mismatch", "provider_auth_error", "callback_reached", "login_window_closed":
 		return strings.TrimSpace(status)
 	default:
 		return "browser_automation_failed"

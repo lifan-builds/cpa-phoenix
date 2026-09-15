@@ -201,6 +201,9 @@ func (b *loginBrowser) run(ctx context.Context, oauthURL, email, accountID strin
 			continue
 		}
 		switch state {
+		case "provider_auth_error":
+			reportOnce(state)
+			return errors.New(state)
 		case "email_submitted":
 			emailSubmitted = true
 			reportOnce(state)
@@ -261,8 +264,9 @@ const visible=e=>!!e&&!e.disabled&&e.getAttribute('aria-disabled')!=='true'&&e.g
 const text=e=>(e.innerText||e.textContent||e.value||'').trim().toLowerCase();
 const click=e=>{e.focus();e.click();};
 const set=(e,v)=>{const p=Object.getPrototypeOf(e),d=Object.getOwnPropertyDescriptor(p,'value');if(d&&d.set)d.set.call(e,v);else e.value=v;e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));};
-const body=text(document.body);const shownEmails=()=>((document.body.innerText||'').toLowerCase().match(/[a-z0-9.!#$%&'*+/=?^_` + "`" + `{|}~-]+@[a-z0-9.-]+\.[a-z]{2,}/g)||[]);
+const body=text(document.body),title=(document.title||'').trim().toLowerCase();const shownEmails=()=>((document.body.innerText||'').toLowerCase().match(/[a-z0-9.!#$%&'*+/=?^_` + "`" + `{|}~-]+@[a-z0-9.-]+\.[a-z]{2,}/g)||[]);
 if(location.origin!==allowedOrigin)return 'manual_login_required';
+if(/authentication\s+error/.test(title)||/your session has ended/.test(body)||(/authentication\s+error/.test(body)&&/error[_ ]code\s*[:=]/.test(body)))return 'provider_auth_error';
 if(document.querySelector('iframe[src*="captcha" i],iframe[src*="arkose" i],iframe[src*="challenge" i],input[name="cf-turnstile-response"]')||/verify (you are|that you are) human|captcha/.test(body)||document.title.trim().toLowerCase()==='just a moment...')return 'manual_captcha_required';
 const allChoices=[...document.querySelectorAll('input[type="radio"],button,[role="radio"],[data-workspace-id]')];const choices=allChoices.filter(visible);
 const workspacePage=choices.some(e=>e.matches('input[type="radio"],[role="radio"],[data-workspace-id]'))||/choose (a |your )?(workspace|account)|select (a |your )?(workspace|account)/.test(body);

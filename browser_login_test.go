@@ -27,6 +27,8 @@ func (f *loginFixture) handler(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/start":
 		fmt.Fprintf(w, `<!doctype html><input name="email" type="email"><button id="continue">Continue</button><script>document.getElementById('continue').onclick=()=>location='/method?attempt=%d'</script>`, attempt)
+	case "/provider-error":
+		fmt.Fprint(w, `<!doctype html><title>Authentication Error</title><h1>Authentication Error</h1><p>error_code: unknown_error</p><p>Your session has ended</p><input name="email" type="email"><button id="continue">Continue</button>`)
 	case "/method":
 		fmt.Fprintf(w, `<!doctype html><button id="email-code">Continue with email</button><script>document.getElementById('email-code').onclick=()=>location='/otp?attempt=%d'</script>`, attempt)
 	case "/otp":
@@ -227,6 +229,42 @@ func TestLoginBrowserRecipientAndOriginGuards(t *testing.T) {
 	cancel()
 	if !errorsIsDeadline(err) || !containsStatus(statuses, "manual_login_required") || foreignSubmitted.Load() {
 		t.Fatalf("foreign origin was acted on: err=%v statuses=%v submitted=%v", err, statuses, foreignSubmitted.Load())
+	}
+}
+
+func TestLoginBrowserProviderAuthErrorStopsPromptly(t *testing.T) {
+	fixture := &loginFixture{selected: make(map[int]string), resends: make(map[int]int)}
+	server := httptest.NewServer(http.HandlerFunc(fixture.handler))
+	defer server.Close()
+	b := newFixtureLoginBrowser(t, func(_ string, _ time.Time) (thunderbirdCode, error) {
+		return thunderbirdCode{Code: "000006", ReceivedAt: time.Now()}, nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var statuses []string
+	err := b.run(ctx, server.URL+"/provider-error?attempt=6", "same@example.test", "workspace-6", time.Now().Add(-time.Second), func(s string) {
+		statuses = append(statuses, s)
+	}, true)
+	if err == nil || !strings.Contains(err.Error(), "provider_auth_error") {
+		t.Fatalf("provider authentication page should stop with a stable error, got %v (statuses %v)", err, statuses)
+	}
+	if errorsIsDeadline(err) || !containsStatus(statuses, "provider_auth_error") {
+		t.Fatalf("provider authentication page did not stop promptly: err=%v statuses=%v", err, statuses)
+	}
+	count := 0
+	for _, status := range statuses {
+		if status == "provider_auth_error" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("provider authentication status should be reported once: %v", statuses)
+	}
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if fixture.selected[6] != "" {
+		t.Fatalf("provider error page must not select a workspace: %q", fixture.selected[6])
 	}
 }
 

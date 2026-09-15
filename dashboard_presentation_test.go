@@ -49,6 +49,8 @@ assert.match(document.querySelector('#workspace-help').textContent,/seat-1234567
 phoenixShowAgentLogin({oauth_url:'https://auth.openai.com/authorize?client_id=x&amp;state=s#nested&amp;fragment',attempt:'two',email:'seat@example.test',seat:'seat-12345678'});
 assert.equal(document.querySelector('#current-login').href,'https://auth.openai.com/authorize?client_id=x&state=s#nested&amp;fragment');
 assert.throws(()=>phoenixShowAgentLogin({oauth_url:'https://auth.openai.com/authorize?amp;client_id=x',attempt:'two',email:'seat@example.test',seat:'seat-12345678'}),/oauth_url_invalid/);
+assert.match(phoenixAutomationMessage('provider_auth_error'),/OpenAI/);
+assert.match(phoenixAutomationMessage('provider_auth_error'),/resume the repair queue/i);
 `
 	if out, err := exec.Command("node", "-e", harness).CombinedOutput(); err != nil {
 		t.Fatalf("dashboard OAuth boundary normalization failed: %v\n%s", err, out)

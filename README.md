@@ -25,10 +25,8 @@ OAuth success before its plugin inventory exposes the saved record, Phoenix
 waits a short bounded interval for replacement propagation. A later resume
 also reconciles an already-healthy replacement without starting OAuth again.
 An obsolete record is moved to owner-only quarantine before login and is not
-restored automatically. The callback forwarder is temporary and binds only to
-`127.0.0.1:1455`; an exact `localhost:1455` redirect from native CPA is
-normalized to that IPv4 loopback so Chrome cannot fall onto an unavailable
-IPv6 localhost listener. During login, Phoenix enters a fresh matching OpenAI
+restored automatically. The callback forwarder is temporary and binds to
+`localhost:1455`, preserving CPA's exact registered redirect URI. During login, Phoenix enters a fresh matching OpenAI
 verification code from the account's Thunderbird mailbox; entering a code
 manually in the Chrome window follows the same repair flow.
 
@@ -77,6 +75,10 @@ Source builds never initiate authentication or upstream traffic.
 
 Email-code logins can complete unattended while Thunderbird is receiving mail.
 Other verification challenges may still require your interaction.
+
+If OpenAI returns an authentication-error or ended-session page, Phoenix marks
+that attempt failed promptly, keeps the quarantined row safe, and exposes the
+same row through **Resume Repair Queue** so a fresh sign-in can be attempted.
 
 ## Build and package
 

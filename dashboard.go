@@ -187,6 +187,7 @@ function phoenixAutomationMessage(status){
     manual_captcha_required:'Complete the challenge in Phoenix’s Chrome window.',
     manual_login_required:'Finish the current sign-in step in Phoenix’s Chrome window.',
     manual_recipient_mismatch:'The login page shows a different email. Switch to the queued account in Phoenix’s Chrome window.',
+    provider_auth_error:'OpenAI rejected the login session. Complete sign-in again, then resume the repair queue.',
     callback_reached:'Login complete; validating the replacement…',login_window_closed:'Login window closed; checking authorization…'
   })[status]||String(status||'')
 }

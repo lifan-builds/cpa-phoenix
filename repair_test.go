@@ -85,17 +85,17 @@ func TestComposeOAuthURLModePrefillEscapesPlusEmail(t *testing.T) {
 	}
 }
 
-func TestComposeOAuthURLModeNormalizesLocalhostCallback(t *testing.T) {
+func TestComposeOAuthURLModePreservesNativeLocalhostCallback(t *testing.T) {
 	raw := "https://login.example.test/authorize?client_id=x&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&state=s"
 	got, err := composeOAuthURLMode(raw, "seat@example.test", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(got, "redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback") {
-		t.Fatalf("localhost callback must target Phoenix's IPv4 listener: %q", got)
+	if !strings.Contains(got, "redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback") {
+		t.Fatalf("native localhost callback must be preserved: %q", got)
 	}
-	if strings.Contains(got, "redirect_uri=http%3A%2F%2Flocalhost%3A1455") {
-		t.Fatalf("localhost callback was not normalized: %q", got)
+	if strings.Contains(got, "redirect_uri=http%3A%2F%2F127.0.0.1%3A1455") {
+		t.Fatalf("localhost callback was rewritten: %q", got)
 	}
 }
 
@@ -853,6 +853,72 @@ func TestRevivePollExposesTransientAutomationStatusWithoutOAuthURL(t *testing.T)
 	}
 	if _, ok := body["oauth_url"]; ok {
 		t.Fatalf("poll invented an OAuth URL: %v", body)
+	}
+}
+
+func TestReviveQueueStopsPromptlyOnProviderAuthError(t *testing.T) {
+	db, _ := setupRepairRecoveryStore(t)
+	jobID := "repair-provider-auth-error"
+	seedRepairRecoveryState(t, db, jobID, "running", "queued", "")
+	expected := account{Key: "repair-seat", AccountID: "account-id", Email: "opaque-seat", AuthPath: "/auth/seat.json", AuthDir: "/auth", Physical: true, Status: "authentication_error"}
+
+	inventoryCalls := 0
+	installRepairTestDeps(t,
+		func() ([]account, error) {
+			inventoryCalls++
+			if inventoryCalls == 1 {
+				return []account{expected}, nil
+			}
+			return nil, nil
+		},
+		func(string, string, string) (string, error) { return "quarantine-marker", nil },
+		func(context.Context, string, string) (nativeOAuthStart, error) {
+			return nativeOAuthStart{URL: "https://login.example.test/authorize", State: "provider-error-state"}, nil
+		},
+	)
+	repairRefreshQuota = func(a account) account { return a }
+	pollCalls := 0
+	repairPollNativeOAuth = func(context.Context, string, string) (string, error) {
+		pollCalls++
+		if pollCalls == 1 {
+			return "wait", nil
+		}
+		return "", errors.New("test_poll_sentinel")
+	}
+	browser := &fakeLoginBrowser{run: func(_ context.Context, _ string, _ string, _ string, _ time.Time, report func(string)) error {
+		report("provider_auth_error")
+		return errors.New("provider_auth_error")
+	}}
+	repairNewLoginBrowser = func(context.Context) (loginBrowserController, error) { return browser, nil }
+
+	oldNativeRequest := nativeRequestFn
+	cancelCalls := 0
+	nativeRequestFn = func(_ context.Context, method, path, _ string, query url.Values) (*http.Response, error) {
+		if method == http.MethodDelete && path == "/v0/management/oauth-session" && query.Get("state") == "provider-error-state" {
+			cancelCalls++
+		}
+		return &http.Response{StatusCode: http.StatusNoContent, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(""))}, nil
+	}
+	t.Cleanup(func() { nativeRequestFn = oldNativeRequest })
+
+	started := time.Now()
+	runReviveQueue(&reviveRuntime{jobID: jobID, queued: []account{expected}})
+	if elapsed := time.Since(started); elapsed >= 3*time.Second {
+		t.Fatalf("provider authentication failure waited too long: %v", elapsed)
+	}
+	job, err := readJob(jobID)
+	if err != nil || job.State != "failed" || job.Reason != "provider_auth_error" || job.Done != 0 {
+		t.Fatalf("provider authentication failure was not terminal and sanitized: job=%+v err=%v", job, err)
+	}
+	rows, err := loadRepairRows(jobID)
+	if err != nil || len(rows) != 1 || rows[0].RepairState != "failed" || rows[0].Quarantine != "quarantine-marker" {
+		t.Fatalf("provider authentication failure lost resumable quarantine state: rows=%+v err=%v", rows, err)
+	}
+	if cancelCalls != 1 {
+		t.Fatalf("provider authentication failure cancelled native OAuth %d times", cancelCalls)
+	}
+	if sanitizeAutomationStatus("provider_auth_error") != "provider_auth_error" || sanitizeAutomationStatus("Authentication Error: private detail") != "browser_automation_failed" {
+		t.Fatal("provider status sanitization leaked raw provider text")
 	}
 }
 
