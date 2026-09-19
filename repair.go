@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +25,8 @@ var invalidMarkers = []string{
 }
 
 var errNoActionableAccounts = errors.New("no_actionable_accounts")
+
+var errRepairIdentityUnavailable = errors.New("repair_identity_unavailable")
 
 var errInvalidBrowserMode = errors.New("invalid_browser_mode")
 
@@ -426,6 +429,112 @@ func stopAllRevive() {
 	}
 }
 
+type reviveJobSnapshot struct {
+	ID      string
+	State   string
+	Total   int
+	Done    int
+	Rows    []account
+	Pending []account
+}
+
+func latestReviveJob() (reviveJobSnapshot, bool, error) {
+	db, err := openStore()
+	if err != nil {
+		return reviveJobSnapshot{}, false, err
+	}
+	var snapshot reviveJobSnapshot
+	err = db.QueryRow(`SELECT id,state,total,done FROM jobs WHERE kind='revive' ORDER BY updated_at DESC,created_at DESC,rowid DESC LIMIT 1`).Scan(&snapshot.ID, &snapshot.State, &snapshot.Total, &snapshot.Done)
+	if errors.Is(err, sql.ErrNoRows) {
+		return reviveJobSnapshot{}, false, nil
+	}
+	if err != nil {
+		return reviveJobSnapshot{}, false, err
+	}
+	snapshot.Rows, err = loadRepairRows(snapshot.ID)
+	if err != nil {
+		return reviveJobSnapshot{}, false, err
+	}
+	for _, row := range snapshot.Rows {
+		if row.RepairState != "repaired" {
+			snapshot.Pending = append(snapshot.Pending, row)
+		}
+	}
+	return snapshot, true, nil
+}
+
+// currentRepairSnapshot is the one bounded inventory/quota probe used by
+// Revive startup. Keeping the capture in one path ensures disposition and a
+// newly-created queue see the same exact private identities.
+func currentRepairSnapshot() ([]account, error) {
+	accounts, err := repairListAccounts()
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]account, 0, len(accounts))
+	for _, a := range accounts {
+		if !a.Physical {
+			continue
+		}
+		if (a.Disabled || a.Expired || a.Unavailable) && !invalidAuthDecision(a) {
+			continue
+		}
+		// Use the same quota-auth probe as the scan before snapshotting rows so
+		// an exact provider 401 cannot be missed while status remains active.
+		if !a.Disabled && !a.Expired && !a.Unavailable {
+			a = repairRefreshQuota(a)
+		}
+		if invalidAuthDecision(a) {
+			rows = append(rows, a)
+		}
+	}
+	captured := captureRepairRows(rows)
+	if len(captured) != len(rows) {
+		// A dropped private identity makes a zero-overlap result inconclusive.
+		// Fail closed before disposition so a partial snapshot can never
+		// supersede a recoverable historical queue.
+		return nil, errRepairIdentityUnavailable
+	}
+	return captured, nil
+}
+
+func normalizedRepairIdentity(a account) (accountID, email string) {
+	return strings.TrimSpace(a.AccountID), strings.ToLower(strings.TrimSpace(a.Email))
+}
+
+func exactRepairIdentity(a, b account) bool {
+	aID, aEmail := normalizedRepairIdentity(a)
+	bID, bEmail := normalizedRepairIdentity(b)
+	return aID != "" && aID == bID && aEmail == bEmail
+}
+
+func repairRowsOverlap(pending, current []account) bool {
+	for _, oldRow := range pending {
+		for _, currentRow := range current {
+			if exactRepairIdentity(oldRow, currentRow) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func startReviveSnapshot(headers map[string][]string, mode string, rows []account, supersedeID string) (reviveResponse, error) {
+	id, err := globalJobs.startRevive(rows, supersedeID)
+	if err != nil {
+		return reviveResponse{}, err
+	}
+	runtime := &reviveRuntime{jobID: id, authHeader: managementAuthorization(headers), browserMode: mode, state: "queued", queued: rows}
+	reviveRuntimeState.Lock()
+	reviveRuntimeState.jobs[id] = runtime
+	reviveRuntimeState.Unlock()
+	// Start the first row only after the durable queue and any predecessor
+	// transition have committed. A callback-port failure therefore cannot leave
+	// a partially-created replacement queue.
+	go runReviveQueue(runtime)
+	return reviveResponse{JobID: id, State: "running", Total: len(rows)}, nil
+}
+
 func beginRevive(headers map[string][]string, requestedMode ...string) (reviveResponse, error) {
 	mode := reviveBrowserModeAutomatic
 	if len(requestedMode) > 0 {
@@ -435,68 +544,35 @@ func beginRevive(headers map[string][]string, requestedMode ...string) (reviveRe
 	if err != nil {
 		return reviveResponse{}, err
 	}
+	// Active work owns the global gate. Do not probe or supersede a running
+	// Revive/Ignite job; the existing management action remains the authority.
+	if anyJobActive() {
+		return reviveResponse{}, errIgniteJobActive
+	}
+	prior, hasPrior, err := latestReviveJob()
+	if err != nil {
+		return reviveResponse{}, err
+	}
+	rows, err := currentRepairSnapshot()
+	if err != nil {
+		return reviveResponse{}, err
+	}
+	if hasPrior && len(prior.Pending) > 0 && (prior.State == "failed" || prior.State == "cancelled") {
+		if len(rows) == 0 || repairRowsOverlap(prior.Pending, rows) {
+			if resumed, ok := resumeRevive(headers, mode); ok {
+				return resumed, nil
+			}
+			return reviveResponse{}, errIgniteJobActive
+		}
+		return startReviveSnapshot(headers, mode, rows, prior.ID)
+	}
 	if resumed, ok := resumeRevive(headers, mode); ok {
 		return resumed, nil
 	}
-	accounts, err := repairListAccounts()
-	if err != nil {
-		return reviveResponse{}, err
-	}
-	rows := make([]account, 0, len(accounts))
-	for i, a := range accounts {
-		if !a.Physical {
-			continue
-		}
-		if (a.Disabled || a.Expired || a.Unavailable) && !invalidAuthDecision(a) {
-			continue
-		}
-		// Use the same quota-auth probe as scan before snapshotting rows so an
-		// exact provider 401 cannot be missed while status remains active.
-		if !a.Disabled && !a.Expired && !a.Unavailable {
-			a = refreshQuota(a)
-		}
-		accounts[i] = a
-		if invalidAuthDecision(a) {
-			rows = append(rows, a)
-		}
-	}
-	// host.auth.list intentionally omits the private ChatGPT account ID. Read
-	// the exact credential wrapper once while the old file is still present so
-	// same-email seats remain distinguishable after restart. Never retain the
-	// credential itself in the queue or persisted repair row. Missing private
-	// identity is a sanitized skip: replacement validation can never prove the
-	// correct team without it.
-	rows = captureRepairRows(rows)
 	if len(rows) == 0 {
 		return reviveResponse{}, errNoActionableAccounts
 	}
-	id, err := globalJobs.start("revive", len(rows))
-	if err != nil {
-		return reviveResponse{}, err
-	}
-	db, err := openStore()
-	if err != nil {
-		globalJobs.stop()
-		return reviveResponse{}, err
-	}
-	for i, a := range rows {
-		// Physical paths are needed only by the in-memory row that is about to
-		// be quarantined. Never persist them: after restart, queued rows resolve
-		// the current exact path from host.auth.list, while quarantined rows no
-		// longer need their predecessor path.
-		if _, err := db.Exec(`INSERT INTO repair_rows(job_id,ordinal,account_key,auth_id,auth_index,email,account_id,auth_path,auth_dir,state) VALUES(?,?,?,?,?,?,?,?,?,?)`, id, i+1, a.Key, a.AuthID, a.AuthIndex, a.Email, a.AccountID, "", "", "queued"); err != nil {
-			globalJobs.stop()
-			return reviveResponse{}, err
-		}
-	}
-	runtime := &reviveRuntime{jobID: id, authHeader: managementAuthorization(headers), browserMode: mode, state: "queued", queued: rows}
-	reviveRuntimeState.Lock()
-	reviveRuntimeState.jobs[id] = runtime
-	reviveRuntimeState.Unlock()
-	// Start the first row only after the callback port is owned. Any occupied
-	// port therefore fails before quarantine or OAuth mutation.
-	go runReviveQueue(runtime)
-	return reviveResponse{JobID: id, State: "running", Total: len(rows)}, nil
+	return startReviveSnapshot(headers, mode, rows, "")
 }
 
 func captureRepairIdentity(a account) account {
@@ -528,50 +604,41 @@ func resumeRevive(headers map[string][]string, requestedMode ...string) (reviveR
 	if err != nil {
 		return reviveResponse{}, false
 	}
-	db, err := openStore()
-	if err != nil {
+	snapshot, ok, err := latestReviveJob()
+	if err != nil || !ok {
 		return reviveResponse{}, false
 	}
-	var id, state string
-	var total, done int
-	err = db.QueryRow(`SELECT id,state,total,done FROM jobs WHERE kind='revive' ORDER BY updated_at DESC LIMIT 1`).Scan(&id, &state, &total, &done)
-	if err != nil {
+	if snapshot.State == "completed" || snapshot.State == "superseded" {
 		return reviveResponse{}, false
 	}
-	rows, err := loadRepairRows(id)
-	if err != nil || len(rows) == 0 {
+	if len(snapshot.Pending) == 0 {
 		return reviveResponse{}, false
 	}
-	incomplete := false
-	for _, row := range rows {
-		if row.RepairState != "repaired" {
-			incomplete = true
-			break
+	if snapshot.State != "failed" && snapshot.State != "cancelled" && snapshot.State != "running" && snapshot.State != "awaiting_user" {
+		// Preserve recovery for legacy terminal states written before the
+		// resumable-state vocabulary was stabilized. Explicit completed and
+		// superseded jobs remain terminal and are never revived.
+		if db, openErr := openStore(); openErr == nil {
+			_, _ = db.Exec(`UPDATE jobs SET state='failed',reason='interrupted',updated_at=? WHERE id=?`, time.Now().Unix(), snapshot.ID)
 		}
+		snapshot.State = "failed"
 	}
-	if !incomplete {
-		return reviveResponse{}, false
-	}
-	if state != "failed" && state != "cancelled" && state != "running" && state != "awaiting_user" {
-		state = "failed"
-		_, _ = db.Exec(`UPDATE jobs SET state='failed',reason='interrupted',updated_at=? WHERE id=?`, time.Now().Unix(), id)
-	}
-	if err := globalJobs.claim(id); err != nil {
+	if err := globalJobs.claim(snapshot.ID); err != nil {
 		return reviveResponse{}, false
 	}
 	// A crash can occur after a row is durably marked repaired but before the
 	// aggregate job counter advances. Resume from the first non-repaired row so
 	// a completed OAuth replacement is never quarantined or logged in again.
 	startAt := 0
-	for startAt < len(rows) && rows[startAt].RepairState == "repaired" {
+	for startAt < len(snapshot.Rows) && snapshot.Rows[startAt].RepairState == "repaired" {
 		startAt++
 	}
-	runtime := &reviveRuntime{jobID: id, authHeader: managementAuthorization(headers), browserMode: mode, state: state, queued: rows, startAt: startAt}
+	runtime := &reviveRuntime{jobID: snapshot.ID, authHeader: managementAuthorization(headers), browserMode: mode, state: snapshot.State, queued: snapshot.Rows, startAt: startAt}
 	reviveRuntimeState.Lock()
-	reviveRuntimeState.jobs[id] = runtime
+	reviveRuntimeState.jobs[snapshot.ID] = runtime
 	reviveRuntimeState.Unlock()
 	go runReviveQueue(runtime)
-	return reviveResponse{JobID: id, State: "running", Total: total, AwaitingUser: state == "awaiting_user"}, true
+	return reviveResponse{JobID: snapshot.ID, State: "running", Total: snapshot.Total, AwaitingUser: snapshot.State == "awaiting_user"}, true
 }
 
 func loadRepairRows(jobID string) ([]account, error) {

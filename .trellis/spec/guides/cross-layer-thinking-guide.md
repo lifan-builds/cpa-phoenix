@@ -121,6 +121,16 @@ After implementation:
 - [ ] Checked that derived state points back to the source event identifier
       (`seq`, `id`, `version`) instead of inventing a second cursor
 
+### Durable recovery state versus live inventory
+
+- [ ] If historical recovery rows and freshly probed entities coexist, define
+      which exact job is current before the UI labels an action.
+- [ ] Prove a live snapshot is complete before using zero overlap to abandon or
+      supersede recoverable work.
+- [ ] Use the same deterministic ordering for backend selection, status
+      projection, and visible queue rows. For Phoenix, follow
+      `backend/database-guidelines.md#scenario-revive-queue-reconciliation-with-current-inventory`.
+
 ---
 
 ## Cross-Platform Template Consistency

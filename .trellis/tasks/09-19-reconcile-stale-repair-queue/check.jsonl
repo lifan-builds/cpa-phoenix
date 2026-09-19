@@ -1,0 +1,2 @@
+{"file":".trellis/tasks/09-19-reconcile-stale-repair-queue/research/repository-evidence.md","reason":"Recheck the root cause and all file-anchored state-machine boundaries."}
+{"file":".trellis/spec/backend/error-handling.md","reason":"Recheck existing provider error and resumable quarantine behavior for regressions."}

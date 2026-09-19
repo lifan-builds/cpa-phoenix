@@ -366,6 +366,85 @@ func (m *jobManager) start(kind string, total int) (string, error) {
 	return id, nil
 }
 
+// startRevive atomically persists a fresh Revive snapshot. When supersedeID is
+// set, the terminal predecessor is transitioned in the same transaction as
+// the new job and its rows. Keeping the transition under the global job mutex
+// preserves the single-action gate while the transaction prevents a second
+// caller from observing a half-created replacement queue.
+func (m *jobManager) startRevive(rows []account, supersedeID string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.active != "" {
+		return "", errIgniteJobActive
+	}
+	if len(rows) == 0 {
+		return "", errNoActionableAccounts
+	}
+	db, err := openStore()
+	if err != nil {
+		return "", err
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return "", err
+	}
+	rollback := func() {
+		_ = tx.Rollback()
+	}
+	var existing int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM jobs WHERE state IN ('running','awaiting_user')`).Scan(&existing); err != nil {
+		rollback()
+		return "", err
+	}
+	if existing > 0 {
+		rollback()
+		return "", errIgniteJobActive
+	}
+	if strings.TrimSpace(supersedeID) != "" {
+		var kind, state string
+		if err := tx.QueryRow(`SELECT kind,state FROM jobs WHERE id=?`, supersedeID).Scan(&kind, &state); err != nil {
+			rollback()
+			return "", err
+		}
+		if kind != "revive" || (state != "failed" && state != "cancelled") {
+			rollback()
+			return "", errors.New("revive_job_not_terminal")
+		}
+		result, err := tx.Exec(`UPDATE jobs SET state='superseded',reason='current_inventory_replaced_queue',updated_at=? WHERE id=? AND kind='revive' AND state IN ('failed','cancelled')`, time.Now().Unix(), supersedeID)
+		if err != nil {
+			rollback()
+			return "", err
+		}
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			rollback()
+			if err != nil {
+				return "", err
+			}
+			return "", errors.New("revive_job_not_terminal")
+		}
+	}
+	id := time.Now().UTC().Format("20060102T150405.000000000Z")
+	now := time.Now().Unix()
+	if _, err := tx.Exec(`INSERT INTO jobs(id,kind,state,created_at,updated_at,total) VALUES(?,?,?,?,?,?)`, id, "revive", "running", now, now, len(rows)); err != nil {
+		rollback()
+		return "", err
+	}
+	for i, a := range rows {
+		// Physical paths and credentials remain runtime-only. The durable row
+		// contains only the opaque identity needed for exact resume matching.
+		if _, err := tx.Exec(`INSERT INTO repair_rows(job_id,ordinal,account_key,auth_id,auth_index,email,account_id,auth_path,auth_dir,state) VALUES(?,?,?,?,?,?,?,?,?,?)`, id, i+1, a.Key, a.AuthID, a.AuthIndex, a.Email, a.AccountID, "", "", "queued"); err != nil {
+			rollback()
+			return "", err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	m.ctx, m.cancel = context.WithCancel(context.Background())
+	m.active = id
+	return id, nil
+}
+
 func (m *jobManager) claim(id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -450,7 +529,7 @@ func latestJobProjection() map[string]any {
 	}
 	var id, kind, state, reason, result string
 	var total, done int
-	if err := db.QueryRow(`SELECT id,kind,state,total,done,reason,result_json FROM jobs ORDER BY updated_at DESC LIMIT 1`).Scan(&id, &kind, &state, &total, &done, &reason, &result); err != nil {
+	if err := db.QueryRow(`SELECT id,kind,state,total,done,reason,result_json FROM jobs ORDER BY updated_at DESC,created_at DESC,rowid DESC LIMIT 1`).Scan(&id, &kind, &state, &total, &done, &reason, &result); err != nil {
 		return nil
 	}
 	return map[string]any{"id": id, "kind": kind, "state": state, "total": total, "done": done, "reason": reason, "result": result}
@@ -461,7 +540,14 @@ func incompleteRepairQueue() []map[string]any {
 	if err != nil {
 		return nil
 	}
-	rows, err := db.Query(`SELECT email,account_id,account_key,state,quarantine FROM repair_rows WHERE state<>'repaired' ORDER BY job_id,ordinal`)
+	var jobID, jobState string
+	if err := db.QueryRow(`SELECT id,state FROM jobs WHERE kind='revive' ORDER BY updated_at DESC,created_at DESC,rowid DESC LIMIT 1`).Scan(&jobID, &jobState); err != nil {
+		return nil
+	}
+	if jobState != "running" && jobState != "awaiting_user" && jobState != "failed" && jobState != "cancelled" {
+		return nil
+	}
+	rows, err := db.Query(`SELECT email,account_id,account_key,state,quarantine FROM repair_rows WHERE job_id=? AND state<>'repaired' ORDER BY ordinal`, jobID)
 	if err != nil {
 		return nil
 	}

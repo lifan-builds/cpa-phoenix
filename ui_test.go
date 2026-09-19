@@ -82,7 +82,7 @@ func TestDashboardRepairQueueSummaryAndPrivacy(t *testing.T) {
 	dashboard := string(dashboardPageHTML())
 	for _, required := range []string{
 		"String((queue||[]).length)+' in repair queue · '+String(invalid||0)+' still invalid in CPA",
-		"button.textContent=active?'Repair In Progress':(hasQueue?'Resume Repair Queue':'Revive Invalid Accounts')",
+		"button.textContent=active?'Repair In Progress':(hasQueue?(hasCurrent?'Repair Current Invalid Accounts':'Resume Repair Queue'):'Revive Invalid Accounts')",
 		"phoenixActionInFlight||Boolean(active)",
 	} {
 		if !strings.Contains(dashboard, required) {
@@ -93,6 +93,28 @@ func TestDashboardRepairQueueSummaryAndPrivacy(t *testing.T) {
 		if strings.Contains(dashboard, forbidden) {
 			t.Fatalf("dashboard contains private identity/credential field %q", forbidden)
 		}
+	}
+}
+
+func TestDashboardRepairActionCopyDistinguishesCurrentInvalidWork(t *testing.T) {
+	script := strings.Split(strings.Split(dashboardHTML, "<script>")[1], "</script>")[0]
+	script = strings.Replace(script, "\nscan()\n", "\n", 1)
+	harness := `
+const assert=require('node:assert/strict'),elements=new Map();
+global.document={querySelector(s){if(!elements.has(s))elements.set(s,{value:'',textContent:'',disabled:false});return elements.get(s)}};
+` + script + `
+const queue=[{email:'old@example.test',seat:'seat-old',state:'failed'}],button=document.querySelector('#revive');
+phoenixSetActionAvailability(0,2,false,queue);
+assert.equal(button.textContent,'Repair Current Invalid Accounts');
+phoenixSetActionAvailability(0,0,false,queue);
+assert.equal(button.textContent,'Resume Repair Queue');
+phoenixSetActionAvailability(0,2,true,queue);
+assert.equal(button.textContent,'Repair In Progress');
+phoenixSetActionAvailability(0,2,false,[]);
+assert.equal(button.textContent,'Revive Invalid Accounts');
+`
+	if out, err := exec.Command("node", "-e", harness).CombinedOutput(); err != nil {
+		t.Fatalf("dashboard repair action copy failed: %v\n%s", err, out)
 	}
 }
 

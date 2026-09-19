@@ -281,7 +281,7 @@ func TestCaptureRepairRowsSkipsMissingPrivateAccountID(t *testing.T) {
 	}
 }
 
-func TestBeginReviveDoesNotPersistMissingPrivateIdentity(t *testing.T) {
+func TestBeginReviveRejectsIncompletePrivateIdentitySnapshot(t *testing.T) {
 	db, _ := setupRepairRecoveryStore(t)
 	installRepairTestDeps(t,
 		func() ([]account, error) {
@@ -299,20 +299,265 @@ func TestBeginReviveDoesNotPersistMissingPrivateIdentity(t *testing.T) {
 	repairBindCallbackForwarder = func() (*callbackForwarder, error) { return nil, errors.New("callback_port_unavailable") }
 	t.Cleanup(func() { repairBindCallbackForwarder = oldBind })
 
-	response, err := beginRevive(nil)
-	if err != nil || response.Total != 1 {
-		t.Fatalf("beginRevive should queue only the exact-identity row: response=%+v err=%v", response, err)
+	if _, err := beginRevive(nil); !errors.Is(err, errRepairIdentityUnavailable) {
+		t.Fatalf("incomplete private-identity snapshot should fail closed: err=%v", err)
 	}
-	job := waitForRepairJobState(t, response.JobID, "failed")
-	if job.Reason != "callback_port_unavailable" {
-		t.Fatalf("unexpected filtered queue terminal reason: %+v", job)
-	}
-	rows, err := loadRepairRows(response.JobID)
-	if err != nil || len(rows) != 1 || rows[0].AccountID != "account-known" {
-		t.Fatalf("missing private identity leaked into durable queue: rows=%+v err=%v", rows, err)
-	}
-	if _, err := db.Exec(`DELETE FROM jobs WHERE id=?`, response.JobID); err != nil {
+	var jobs, rows int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM jobs`).Scan(&jobs); err != nil {
 		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM repair_rows`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if jobs != 0 || rows != 0 {
+		t.Fatalf("incomplete snapshot persisted partial queue: jobs=%d rows=%d", jobs, rows)
+	}
+}
+
+func TestReviveRouteSanitizesIncompletePrivateIdentityFailure(t *testing.T) {
+	_, _ = setupRepairRecoveryStore(t)
+	installRepairTestDeps(t,
+		func() ([]account, error) {
+			return []account{{Key: "missing-private-id", AuthIndex: "missing-index", Email: "owner@example.test", Physical: true, Status: "authentication_error"}}, nil
+		},
+		func(string, string, string) (string, error) { return "unexpected-quarantine", nil },
+		func(context.Context, string, string) (nativeOAuthStart, error) {
+			return nativeOAuthStart{}, errors.New("unexpected-oauth")
+		},
+	)
+	response := routeManagement(managementRequest{
+		Method: http.MethodPost,
+		Path:   "/v0/management/plugins/cpa-phoenix/revive",
+		Body:   []byte(`{"acknowledge":"CPA_PHOENIX_ONE_CLICK","browser_mode":"agent"}`),
+	})
+	if response.StatusCode != http.StatusServiceUnavailable || string(response.Body) != `{"error":"inventory_unavailable"}` {
+		t.Fatalf("incomplete identity response status=%d body=%s", response.StatusCode, response.Body)
+	}
+}
+
+func TestRepairRowsOverlapRequiresExactPrivateIdentityAndEmail(t *testing.T) {
+	oldRow := account{AccountID: " account-a ", Email: "Owner@Example.test"}
+	if !repairRowsOverlap([]account{oldRow}, []account{{AccountID: "account-a", Email: " owner@example.test "}}) {
+		t.Fatal("trimmed account ID and case-insensitive email should overlap")
+	}
+	if repairRowsOverlap([]account{oldRow}, []account{{AccountID: "account-a", Email: "other@example.test"}}) {
+		t.Fatal("same private account with a different email must not overlap")
+	}
+	if repairRowsOverlap([]account{oldRow}, []account{{AccountID: "account-b", Email: "owner@example.test"}}) {
+		t.Fatal("same email with a different private account must not overlap")
+	}
+	if repairRowsOverlap([]account{{AccountID: "", Email: oldRow.Email}}, []account{{AccountID: "", Email: oldRow.Email}}) {
+		t.Fatal("missing private identity must never overlap")
+	}
+}
+
+func TestBeginReviveSupersedesDisjointTerminalQueueAndPreservesRows(t *testing.T) {
+	db, _ := setupRepairRecoveryStore(t)
+	oldID := "old-revive"
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO jobs(id,kind,state,created_at,updated_at,total,reason) VALUES(?,?,?,?,?,?,?)`, oldID, "revive", "failed", now, now, 1, "old_failure"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO repair_rows(job_id,ordinal,account_key,auth_id,auth_index,email,account_id,state,reason,quarantine) VALUES(?,?,?,?,?,?,?,?,?,?)`, oldID, 1, "old-key", "old-auth", "old-index", "old@example.test", "old-account", "quarantined", "old_row_reason", "opaque-quarantine"); err != nil {
+		t.Fatal(err)
+	}
+	current := []account{
+		{Key: "new-key-a", AuthID: "new-auth-a", AuthIndex: "new-index-a", AccountID: "new-account-a", Email: "new-a@example.test", AuthPath: "/auth/new-a.json", AuthDir: "/auth", Physical: true, Status: "authentication_error", AccessTokenValue: "fixture-token"},
+		{Key: "new-key-b", AuthID: "new-auth-b", AuthIndex: "new-index-b", AccountID: "new-account-b", Email: "new-b@example.test", AuthPath: "/auth/new-b.json", AuthDir: "/auth", Physical: true, Status: "authentication_error", AccessTokenValue: "fixture-token"},
+	}
+	installRepairTestDeps(t,
+		func() ([]account, error) { return current, nil },
+		func(string, string, string) (string, error) { return "unexpected-quarantine", nil },
+		func(context.Context, string, string) (nativeOAuthStart, error) {
+			return nativeOAuthStart{}, errors.New("unexpected-oauth")
+		},
+	)
+	oldRefreshQuota := repairRefreshQuota
+	oldBind := repairBindCallbackForwarder
+	repairRefreshQuota = func(a account) account {
+		a.QuotaStatusCode = http.StatusUnauthorized
+		return a
+	}
+	repairBindCallbackForwarder = func() (*callbackForwarder, error) { return nil, errors.New("callback_port_unavailable") }
+	t.Cleanup(func() {
+		repairRefreshQuota = oldRefreshQuota
+		repairBindCallbackForwarder = oldBind
+	})
+
+	response, err := beginRevive(nil, reviveBrowserModeAgent)
+	if err != nil || response.Total != len(current) || response.JobID == oldID {
+		t.Fatalf("disjoint current inventory did not create a fresh queue: response=%+v err=%v", response, err)
+	}
+	waitForRepairJobState(t, response.JobID, "failed")
+	oldJob, err := readJob(oldID)
+	if err != nil || oldJob.State != "superseded" || oldJob.Reason != "current_inventory_replaced_queue" {
+		t.Fatalf("old queue was not durably superseded: job=%+v err=%v", oldJob, err)
+	}
+	oldRows, err := loadRepairRows(oldID)
+	if err != nil || len(oldRows) != 1 || oldRows[0].RepairState != "quarantined" || oldRows[0].Quarantine != "opaque-quarantine" {
+		t.Fatalf("superseding changed historical row/quarantine: rows=%+v err=%v", oldRows, err)
+	}
+	newRows, err := loadRepairRows(response.JobID)
+	if err != nil || len(newRows) != len(current) || newRows[0].AccountID != current[0].AccountID || newRows[1].AccountID != current[1].AccountID {
+		t.Fatalf("fresh queue did not preserve exact current identities: rows=%+v err=%v", newRows, err)
+	}
+	queue := incompleteRepairQueue()
+	if len(queue) != len(current) {
+		t.Fatalf("visible queue should project only fresh rows: queue=%v", queue)
+	}
+	for _, row := range queue {
+		if row["email"] == "old@example.test" {
+			t.Fatalf("superseded row leaked into visible queue: %v", queue)
+		}
+	}
+}
+
+func TestBeginReviveOverlappingTerminalQueueResumesWithoutSuperseding(t *testing.T) {
+	db, _ := setupRepairRecoveryStore(t)
+	oldID := "overlap-revive"
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO jobs(id,kind,state,created_at,updated_at,total,reason) VALUES(?,?,?,?,?,?,?)`, oldID, "revive", "failed", now, now, 1, "old_failure"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO repair_rows(job_id,ordinal,account_key,auth_id,auth_index,email,account_id,state,quarantine) VALUES(?,?,?,?,?,?,?,?,?)`, oldID, 1, "old-key", "old-auth", "old-index", "owner@example.test", "account-a", "quarantined", "opaque-quarantine"); err != nil {
+		t.Fatal(err)
+	}
+	current := account{Key: "new-key", AuthID: "new-auth", AuthIndex: "new-index", AccountID: "account-a", Email: " OWNER@example.test ", AuthPath: "/auth/current.json", AuthDir: "/auth", Physical: true, Status: "authentication_error", AccessTokenValue: "fixture-token"}
+	installRepairTestDeps(t,
+		func() ([]account, error) { return []account{current}, nil },
+		func(string, string, string) (string, error) { return "unexpected-quarantine", nil },
+		func(context.Context, string, string) (nativeOAuthStart, error) {
+			return nativeOAuthStart{}, errors.New("unexpected-oauth")
+		},
+	)
+	oldRefreshQuota := repairRefreshQuota
+	oldBind := repairBindCallbackForwarder
+	repairRefreshQuota = func(a account) account { a.QuotaStatusCode = http.StatusUnauthorized; return a }
+	repairBindCallbackForwarder = func() (*callbackForwarder, error) { return nil, errors.New("callback_port_unavailable") }
+	t.Cleanup(func() {
+		repairRefreshQuota = oldRefreshQuota
+		repairBindCallbackForwarder = oldBind
+	})
+
+	response, err := beginRevive(nil, reviveBrowserModeAgent)
+	if err != nil || response.JobID != oldID {
+		t.Fatalf("exact overlap should resume old queue: response=%+v err=%v", response, err)
+	}
+	waitForRepairJobState(t, oldID, "failed")
+	job, err := readJob(oldID)
+	if err != nil || job.State == "superseded" || job.Reason != "callback_port_unavailable" {
+		t.Fatalf("overlap incorrectly superseded or lost failure state: job=%+v err=%v", job, err)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM jobs WHERE kind='revive'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("overlap created an unexpected second Revive job: count=%d", count)
+	}
+}
+
+func TestBeginReviveWithNoCurrentInvalidWorkResumesTerminalQueue(t *testing.T) {
+	db, _ := setupRepairRecoveryStore(t)
+	oldID := "no-current-work"
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO jobs(id,kind,state,created_at,updated_at,total,reason) VALUES(?,?,?,?,?,?,?)`, oldID, "revive", "failed", now, now, 1, "old_failure"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO repair_rows(job_id,ordinal,account_key,auth_id,auth_index,email,account_id,state,quarantine) VALUES(?,?,?,?,?,?,?,?,?)`, oldID, 1, "old-key", "old-auth", "old-index", "owner@example.test", "account-a", "quarantined", "opaque-quarantine"); err != nil {
+		t.Fatal(err)
+	}
+	current := account{Key: "new-key", AuthID: "new-auth", AuthIndex: "new-index", AccountID: "account-a", Email: "owner@example.test", AuthPath: "/auth/current.json", AuthDir: "/auth", Physical: true, Status: "active", AccessTokenValue: "fixture-token"}
+	installRepairTestDeps(t,
+		func() ([]account, error) { return []account{current}, nil },
+		func(string, string, string) (string, error) { return "unexpected-quarantine", nil },
+		func(context.Context, string, string) (nativeOAuthStart, error) {
+			return nativeOAuthStart{}, errors.New("unexpected-oauth")
+		},
+	)
+	oldRefreshQuota := repairRefreshQuota
+	repairRefreshQuota = func(a account) account { a.QuotaStatusCode = http.StatusOK; return a }
+	t.Cleanup(func() { repairRefreshQuota = oldRefreshQuota })
+
+	response, err := beginRevive(nil, reviveBrowserModeAgent)
+	if err != nil || response.JobID != oldID {
+		t.Fatalf("no fresh invalid work should resume old queue: response=%+v err=%v", response, err)
+	}
+	job := waitForRepairJobState(t, oldID, "completed")
+	if job.Done != 1 {
+		t.Fatalf("resumed healthy replacement did not complete old queue: %+v", job)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM jobs WHERE kind='revive'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("no-work resume created an unexpected second Revive job: count=%d", count)
+	}
+}
+
+func TestBeginReviveNeverProbesOrSupersedesActiveJob(t *testing.T) {
+	_, _ = setupRepairRecoveryStore(t)
+	id, err := globalJobs.start("revive", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	probed := false
+	oldInventory := repairListAccounts
+	repairListAccounts = func() ([]account, error) {
+		probed = true
+		return nil, errors.New("active job must block inventory probe")
+	}
+	t.Cleanup(func() { repairListAccounts = oldInventory })
+	if _, err := beginRevive(nil, reviveBrowserModeAgent); !errors.Is(err, errIgniteJobActive) {
+		t.Fatalf("active job did not retain job lock: id=%q err=%v", id, err)
+	}
+	if probed {
+		t.Fatal("active job triggered a fresh inventory probe")
+	}
+}
+
+func TestSupersededReviveIsExcludedFromQueueAfterStoreReopen(t *testing.T) {
+	db, store := setupRepairRecoveryStore(t)
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO jobs(id,kind,state,created_at,updated_at,total,reason) VALUES(?,?,?,?,?,?,?)`, "superseded-latest", "revive", "superseded", now, now, 1, "current_inventory_replaced_queue"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO repair_rows(job_id,ordinal,account_key,email,account_id,state,quarantine) VALUES(?,?,?,?,?,?,?)`, "superseded-latest", 1, "old-key", "old@example.test", "old-account", "quarantined", "opaque-quarantine"); err != nil {
+		t.Fatal(err)
+	}
+	if queue := incompleteRepairQueue(); len(queue) != 0 {
+		t.Fatalf("superseded rows leaked from in-process projection: %v", queue)
+	}
+	closeStore()
+	if _, err := openStore(); err != nil {
+		t.Fatal(err)
+	}
+	if queue := incompleteRepairQueue(); len(queue) != 0 {
+		t.Fatalf("superseded rows leaked after reopening %s: %v", store, queue)
+	}
+	if _, ok := resumeRevive(nil); ok {
+		t.Fatal("superseded job remained resumable after reopening the store")
+	}
+}
+
+func TestLatestJobProjectionBreaksSecondResolutionTiesByCreationOrder(t *testing.T) {
+	db, _ := setupRepairRecoveryStore(t)
+	now := time.Now().Unix()
+	for _, job := range []struct {
+		id    string
+		state string
+	}{
+		{id: "older-job", state: "superseded"},
+		{id: "newer-job", state: "running"},
+	} {
+		if _, err := db.Exec(`INSERT INTO jobs(id,kind,state,created_at,updated_at,total) VALUES(?,?,?,?,?,?)`, job.id, "revive", job.state, now, now, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	projection := latestJobProjection()
+	if projection == nil || projection["id"] != "newer-job" {
+		t.Fatalf("latest job projection did not use insertion tie-break: %+v", projection)
 	}
 }
 

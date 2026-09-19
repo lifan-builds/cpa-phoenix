@@ -319,6 +319,9 @@ func routeManagement(req managementRequest) managementResponse {
 			if errors.Is(err, errNoActionableAccounts) {
 				return jsonResponse(http.StatusConflict, map[string]string{"error": "no_actionable_accounts"})
 			}
+			if errors.Is(err, errRepairIdentityUnavailable) {
+				return jsonResponse(http.StatusServiceUnavailable, map[string]string{"error": "inventory_unavailable"})
+			}
 			if errors.Is(err, errInvalidBrowserMode) {
 				return jsonResponse(http.StatusBadRequest, map[string]string{"error": "invalid_browser_mode"})
 			}

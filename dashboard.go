@@ -159,11 +159,11 @@ function phoenixFilterAccounts(){
   document.querySelector('#account-results').textContent='Showing '+rows.length+' of '+phoenixAccountRows.length+' accounts'+(phoenixQueueRows.length?' · Repair queue shown separately':'');
 }
 function phoenixSetActionAvailability(fresh,invalid,active,queue){
-  const locked=phoenixActionInFlight||Boolean(active),hasQueue=Boolean((queue||[]).length),button=document.querySelector('#revive');
+  const locked=phoenixActionInFlight||Boolean(active),hasQueue=Boolean((queue||[]).length),hasCurrent=Number(invalid||0)>0,button=document.querySelector('#revive');
   document.querySelector('#ignite').disabled=locked||Number(fresh||0)<=0;
   document.querySelector('#agent-mode').disabled=locked;
   button.disabled=locked||(Number(invalid||0)<=0&&!hasQueue);
-  button.textContent=active?'Repair In Progress':(hasQueue?'Resume Repair Queue':'Revive Invalid Accounts');
+  button.textContent=active?'Repair In Progress':(hasQueue?(hasCurrent?'Repair Current Invalid Accounts':'Resume Repair Queue'):'Revive Invalid Accounts');
   document.querySelector('#invalid').textContent=hasQueue?(String((queue||[]).length)+' in repair queue · '+String(invalid||0)+' still invalid in CPA'):String(invalid||0)+' actionable'
 }
 function phoenixRenderJob(job){
