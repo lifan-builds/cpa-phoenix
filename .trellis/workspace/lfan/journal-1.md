@@ -71,3 +71,25 @@ Expanded the project-local Phoenix repair skill with deterministic queue ownersh
 ### Status
 
 [OK] **Completed**
+
+
+## Session 4: Reconcile stale Phoenix repair queue
+<!-- trellis-session: v=2 fp=206e91b54e9064ea -->
+
+**Date**: 2026-09-19
+**Task**: Reconcile stale Phoenix repair queue
+**Branch**: `codex/reconcile-stale-repair-queue`
+
+### Summary
+
+Implemented atomic live-inventory reconciliation for stale Revive queues, preserved superseded recovery evidence, added deterministic queue projections and regression coverage, deployed the Darwin plugin, and live-validated a fresh two-row repair through terminal completion.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `72b2f0f` | fix: reconcile stale Phoenix repair queues |
+
+### Status
+
+[OK] **Completed**
