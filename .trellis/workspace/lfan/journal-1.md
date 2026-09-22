@@ -93,3 +93,26 @@ Implemented atomic live-inventory reconciliation for stale Revive queues, preser
 ### Status
 
 [OK] **Completed**
+
+
+## Session 5: Phoenix Thunderbird sync hardening
+<!-- trellis-session: v=2 fp=c577f4e318fe44b7 -->
+
+**Date**: 2026-09-22
+**Task**: Phoenix Thunderbird sync hardening
+**Branch**: `codex/reconcile-stale-repair-queue`
+
+### Summary
+
+Fixed Phoenix repair timeouts caused by one-time background Thunderbird launch; Thunderbird now activates per queued attempt. Added regression coverage, updated README and phoenix-repair resume guidance, and captured the freshness/timeout/queue-evidence contract in backend specs and Trellis workflow. Tests, race, vet, shell checks, and workflow parsing passed; commits pushed to origin/codex/reconcile-stale-repair-queue.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `c3d78db` | fix: sync Thunderbird for each repair attempt |
+| `abefa45` | docs: capture Phoenix mail sync recovery contract |
+
+### Status
+
+[OK] **Completed**
