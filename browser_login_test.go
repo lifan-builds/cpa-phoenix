@@ -100,6 +100,8 @@ func TestLoginBrowserSequentialWorkspaceFlowAndFreshResend(t *testing.T) {
 	}
 	b := newFixtureLoginBrowser(t, detector)
 	b.resendAfter = 50 * time.Millisecond
+	var thunderbirdLaunches atomic.Int32
+	b.launchThunderbird = func() { thunderbirdLaunches.Add(1) }
 
 	for _, tc := range []struct {
 		attempt int
@@ -129,6 +131,9 @@ func TestLoginBrowserSequentialWorkspaceFlowAndFreshResend(t *testing.T) {
 	}
 	if fixture.resends[2] != 1 {
 		t.Fatalf("second attempt should resend exactly once, got %d", fixture.resends[2])
+	}
+	if got := thunderbirdLaunches.Load(); got != 2 {
+		t.Fatalf("Thunderbird should be reopened for each login attempt, got %d launches", got)
 	}
 }
 

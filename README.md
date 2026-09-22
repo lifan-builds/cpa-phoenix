@@ -42,10 +42,18 @@ The skill lives in `.agents/skills` for repository discovery.
 
 Install Google Chrome and configure the account mailboxes in Thunderbird with
 message synchronization enabled (including downloading message bodies). Phoenix
-starts Thunderbird for mail delivery and uses its existing local mail files;
+brings Thunderbird forward at the start of each queued login so the matching
+account can synchronize, then uses its existing local mail files;
 it does not need your mailbox password. Click **Revive Invalid Accounts** in
 the existing Management page. The plugin owns the browser and queue, so the
 dashboard can be closed and no Codex agent needs to remain running.
+
+The fact that Thunderbird is already running is not enough: the foreground
+activation is deliberate because it triggers synchronization for the mailbox
+needed by that specific attempt. Do not replace it with a one-time background
+launch. If an older run ended with `oauth_timeout` and the code appeared in
+Thunderbird only afterward, update/restart the plugin once and resume the
+preserved queue; do not start a second queue.
 
 Phoenix keeps its Chrome profile under
 `~/.cli-proxy-api-state/cpa-phoenix/browser`. This is separate from your normal

@@ -21,14 +21,14 @@ import (
 // loginBrowser owns a dedicated Chrome process. It deliberately uses its own
 // profile: neither Codex nor the user's everyday browser is needed or touched.
 type loginBrowser struct {
-	allocCtx        context.Context
-	browserCtx      context.Context
-	cancelAlloc     context.CancelFunc
-	cancelBrowser   context.CancelFunc
-	detectCode      func(string, time.Time) (thunderbirdCode, error)
-	resendAfter     time.Duration
-	thunderbirdOnce sync.Once
-	closeOnce       sync.Once
+	allocCtx          context.Context
+	browserCtx        context.Context
+	cancelAlloc       context.CancelFunc
+	cancelBrowser     context.CancelFunc
+	detectCode        func(string, time.Time) (thunderbirdCode, error)
+	resendAfter       time.Duration
+	launchThunderbird func()
+	closeOnce         sync.Once
 }
 
 func newLoginBrowser(ctx context.Context) (*loginBrowser, error) {
@@ -47,7 +47,12 @@ func newLoginBrowser(ctx context.Context) (*loginBrowser, error) {
 		chromedp.NoDefaultBrowserCheck,
 		chromedp.NoFirstRun,
 	)
-	return newLoginBrowserWithOptions(ctx, opts, detectThunderbirdCode)
+	b, err := newLoginBrowserWithOptions(ctx, opts, detectThunderbirdCode)
+	if err != nil {
+		return nil, err
+	}
+	b.launchThunderbird = launchThunderbird
+	return b, nil
 }
 
 func newLoginBrowserWithOptions(ctx context.Context, opts []chromedp.ExecAllocatorOption, detector func(string, time.Time) (thunderbirdCode, error)) (*loginBrowser, error) {
@@ -66,7 +71,17 @@ func newLoginBrowserWithOptions(ctx context.Context, opts []chromedp.ExecAllocat
 		allocCtx: allocCtx, browserCtx: browserCtx,
 		cancelAlloc: cancelAlloc, cancelBrowser: cancelBrowser,
 		detectCode: detector, resendAfter: 45 * time.Second,
+		launchThunderbird: func() {},
 	}, nil
+}
+
+func launchThunderbird() {
+	if runtime.GOOS == "darwin" {
+		// Bring Thunderbird forward for every login attempt. Opening it in the
+		// background only starts the process; it does not reliably trigger the
+		// queued account's IMAP synchronization before code polling begins.
+		_ = exec.Command("/usr/bin/open", "-a", "Thunderbird").Run()
+	}
 }
 
 func (b *loginBrowser) Close() error {
@@ -112,13 +127,12 @@ func (b *loginBrowser) run(ctx context.Context, oauthURL, email, accountID strin
 		}
 	}
 
-	// Thunderbird is launched at most once for the lifetime of this controller.
-	// It performs mailbox synchronization; Phoenix only reads the local mailbox.
-	b.thunderbirdOnce.Do(func() {
-		if runtime.GOOS == "darwin" {
-			_ = exec.Command("/usr/bin/open", "-gja", "Thunderbird").Run()
-		}
-	})
+	// Thunderbird performs mailbox synchronization; Phoenix only reads the
+	// local mailbox. Reopen it for each queued account so a prior attempt's
+	// active mailbox cannot leave the next recipient's local mbox stale.
+	if b.launchThunderbird != nil {
+		b.launchThunderbird()
+	}
 
 	tabCtx, cancelTab := chromedp.NewContext(b.browserCtx)
 	defer cancelTab()

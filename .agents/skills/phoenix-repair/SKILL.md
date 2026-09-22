@@ -27,9 +27,11 @@ repair path.
 2. Read only `#status`, `#current-login` text/href,
    `#agent-login[data-attempt]`, and the visible repair-queue rows. Keep login
    URLs, attempt identifiers, and codes in variables; never print them. Open
-   the current login URL in regular Chrome once per attempt. If an existing
-   attempt is already displayed, resume that attempt instead of starting
-   another one.
+   the current login URL in regular Chrome once per attempt. Phoenix also
+   brings Thunderbird forward at the start of each attempt so the matching
+   mailbox can synchronize before Phoenix reads its local mail files. If an
+   existing attempt is already displayed, resume that attempt instead of
+   starting another one.
 
 ## Per-attempt login
 
@@ -66,10 +68,13 @@ repair path.
    mismatch, or non-email MFA, stop and ask the user to complete the visible
    challenge in Phoenix's Chrome window. Keep the tab available. Do not
    relabel an unrecognized page as a provider error or success.
-8. If mail is missing, open Thunderbird once to synchronize the matching
-   mailbox. Resend at most once and use only a newly arrived code. Stop on a
-   repeated failure or the five-minute attempt timeout; the queue state, not a
-   closed tab, is authoritative.
+8. Thunderbird synchronization is part of every attempt: a Thunderbird
+   process that was started once in the background is not proof that the
+   current recipient's mailbox is fresh. Phoenix's updated plugin brings it
+   forward per attempt; if the code is still missing, wait for synchronization
+   and resend at most once. Use only a newly arrived code. Stop on a repeated
+   failure or the five-minute attempt timeout; the queue state, not a closed
+   tab or a later-arriving email, is authoritative.
 
 ## Completion and resume evidence
 
@@ -88,6 +93,12 @@ repair path.
     A quarantined row must not be quarantined a second time. If Phoenix sees a
     healthy replacement for that private workspace, allow reconciliation to
     finish without another OAuth login; otherwise perform a fresh attempt.
+
+If a previous run ended in `oauth_timeout` but the email appeared in
+Thunderbird afterward, treat that as a synchronization-timing failure. Verify
+the installed plugin includes per-attempt Thunderbird activation, restart CPA
+once if needed, and resume the preserved queue; do not click Revive twice or
+invent a second browser queue.
 
 ## Keep token use low
 
