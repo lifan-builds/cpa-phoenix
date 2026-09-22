@@ -131,6 +131,27 @@ After implementation:
       projection, and visible queue rows. For Phoenix, follow
       `backend/database-guidelines.md#scenario-revive-queue-reconciliation-with-current-inventory`.
 
+### External source freshness versus local cache
+
+When a browser/provider flow depends on a local cache maintained by another
+application (for example, Thunderbird mail files), add an explicit freshness
+boundary before implementing the flow:
+
+- [ ] Identify which application performs synchronization and which layer only
+      reads the cache.
+- [ ] Activate or foreground the synchronizer for every queued attempt; a
+      process that is merely running is not evidence that the right account has
+      synchronized.
+- [ ] Carry an attempt timestamp through detection and reject data received
+      before that timestamp.
+- [ ] Keep missing-data, stale-data, provider-error, and timeout outcomes
+      distinct across browser, service, queue, and dashboard layers.
+- [ ] Test the complete boundary, including delayed synchronization and
+      sequential attempts, not only the local cache reader.
+
+For Phoenix, the concrete contract is
+`backend/browser-mail-integration.md#scenario-revive-email-code-synchronization`.
+
 ---
 
 ## Cross-Platform Template Consistency

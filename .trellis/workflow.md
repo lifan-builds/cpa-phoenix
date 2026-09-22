@@ -534,6 +534,12 @@ The platform prelude auto-handles the context load requirement:
 4. Implement the code per reviewed artifacts
 5. Run project lint and type-check
 
+For changes crossing an external browser, provider, mailbox, or local-cache
+boundary, also record the source-of-truth layer, freshness/activation boundary,
+timeout behavior, and the end-to-end regression that proves them. Do not accept
+"the process was running" or "the UI looked successful" as synchronization or
+queue evidence.
+
 [/codex-inline, Kilo, Antigravity, Devin, DeepSeek Harness]
 
 #### 2.2 Quality check `[required · repeatable]`
@@ -562,6 +568,12 @@ Load the `trellis-check` skill and verify the code per its guidance:
 - Cross-layer consistency (when changes span layers)
 
 If issues are found → fix → re-check, until green.
+
+For external integrations, the quality check must include at least one
+cross-layer test or fixture proving that each queued attempt activates its
+external synchronizer and that stale cached data cannot satisfy a fresh request.
+The final acceptance receipt must come from the owning queue/service state, not
+from a closed browser tab or aggregate health count.
 
 [/codex-inline, Kilo, Antigravity, Devin, DeepSeek Harness]
 
@@ -594,6 +606,11 @@ Load the `trellis-update-spec` skill and review whether this task produced new k
 - Newly discovered patterns or conventions
 - Pitfalls you hit
 - New technical decisions
+
+For browser/provider/mail integrations, the spec review must explicitly capture
+the activation trigger, freshness timestamp, bounded retry/timeout matrix, and
+the authoritative completion receipt. If any of these are missing, update the
+relevant backend spec and cross-layer guide before drafting the commit.
 
 Update the docs under `.trellis/spec/` accordingly. Even if the conclusion is "nothing to update", walk through the judgment.
 

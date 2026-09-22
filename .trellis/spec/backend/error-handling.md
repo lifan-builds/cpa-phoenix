@@ -18,6 +18,19 @@ Questions to answer:
 
 (To be filled by the team)
 
+### External synchronization and timeout errors
+
+`verification_code_waiting` means that the matching mailbox has not yet
+provided a fresh code; it is not a repair failure by itself. `oauth_timeout` is
+the bounded terminal reason when synchronization, login, or callback does not
+finish before the five-minute attempt deadline. The row remains resumable.
+
+The browser layer may report only allowlisted statuses. The queue layer owns
+the terminal row/job reason and must distinguish `oauth_timeout` from
+`provider_auth_error`, CAPTCHA/manual intervention, recipient mismatch, and
+workspace mismatch. Never collapse all of these into a generic success or
+retry loop.
+
 ---
 
 ## Error Types
