@@ -319,8 +319,8 @@ type activationOutcome struct {
 // The production contract sends the normal streamed, non-persisted compact
 // request. A narrowly scoped compatibility retry drops only stream/store when
 // the server explicitly rejects one of those parameters as unknown.
-var probeRequest = []byte(`{"model":"gpt-5.5","instructions":"Reply with OK.","input":[{"role":"user","content":[{"type":"input_text","text":"ping"}]}],"stream":true,"store":false}`)
-var minimalRequest = []byte(`{"model":"gpt-5.5","instructions":"Reply with OK.","input":[{"role":"user","content":[{"type":"input_text","text":"ping"}]}]}`)
+var probeRequest = []byte(`{"model":"gpt-6-sol","instructions":"Reply with OK.","input":[{"role":"user","content":[{"type":"input_text","text":"ping"}]}],"stream":true,"store":false}`)
+var minimalRequest = []byte(`{"model":"gpt-6-sol","instructions":"Reply with OK.","input":[{"role":"user","content":[{"type":"input_text","text":"ping"}]}]}`)
 
 // Kept injectable for deterministic offline tests. The default implementation
 // performs the fixed Codex compact request using a credential held only in
