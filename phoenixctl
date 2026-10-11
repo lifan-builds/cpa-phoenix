@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Terminal client for the local Phoenix management API. The API owns inventory,
+# queue state, workspace validation, and completion; Chrome is opened only for
+# the provider OAuth page that still requires interactive login.
+
+BASE_URL="${CPA_PHOENIX_URL:-http://127.0.0.1:8317}"
+PLUGIN_PATH="/v0/management/plugins/cpa-phoenix"
+POLL_SECONDS="${CPA_PHOENIX_POLL_SECONDS:-1}"
+MANAGEMENT_KEY="${CPA_MANAGEMENT_KEY:-}"
+
+usage() {
+  cat <<'EOF'
+Usage: phoenixctl [options] <command>
+
+Options:
+  --key KEY       CPA management key (prefer CPA_MANAGEMENT_KEY or --key-file)
+  --key-file PATH Read the management key from a protected file
+  --url URL       CPA base URL (default: http://127.0.0.1:8317)
+  -h, --help      Show this help
+
+Commands:
+  status          Refresh and print the sanitized account inventory
+  otp             Show Agent Autofill connector readiness
+  repair          Start or resume Agent-mode repair and follow the queue
+  recover SEAT...  Retry explicitly paused/timed-out seat labels
+  code JOB ATTEMPT
+                  Read a fresh code for an explicitly named active attempt
+  skip JOB ATTEMPT
+                  Mark the current provider-rejected attempt unresolved
+  pause JOB ATTEMPT
+                  Pause an exact-workspace mismatch without waiting for timeout
+  cancel JOB       Cancel one active repair job
+
+The repair command never opens the Phoenix dashboard. It opens regular Chrome
+only when Phoenix publishes the current provider OAuth URL. OAuth, CAPTCHA,
+passkeys, and exact workspace selection remain interactive provider steps.
+EOF
+}
+
+die() {
+  printf 'phoenixctl: %s\n' "$*" >&2
+  exit 1
+}
+
+need_command() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+json_value() {
+  local expression="$1"
+  python3 -c 'import json,sys
+try:
+    value=json.load(sys.stdin)
+    result=eval(sys.argv[1], {"__builtins__": {}, "len": len}, {"v": value})
+    if result is None:
+        raise SystemExit(0)
+    if isinstance(result, bool):
+        print("true" if result else "false")
+    elif isinstance(result, (dict,list)):
+        print(json.dumps(result, separators=(",", ":")))
+    else:
+        print(result)
+except (KeyError, IndexError, TypeError, ValueError, SyntaxError):
+    raise SystemExit(0)' "$expression"
+}
+
+require_key() {
+  if [[ -n "$MANAGEMENT_KEY" ]]; then
+    return
+  fi
+  if [[ -t 0 ]]; then
+    printf 'CPA management key: ' >&2
+    IFS= read -r -s MANAGEMENT_KEY
+    printf '\n' >&2
+  fi
+  [[ -n "$MANAGEMENT_KEY" ]] || die 'set CPA_MANAGEMENT_KEY or pass --key/--key-file'
+}
+
+api() {
+  local method="$1" path="$2" body="${3:-}" response_file status
+  response_file="$(mktemp "${TMPDIR:-/tmp}/phoenixctl.XXXXXX")"
+  if [[ -n "$body" ]]; then
+    status="$(curl -sS -o "$response_file" -w '%{http_code}' \
+      -X "$method" "$BASE_URL$PLUGIN_PATH$path" \
+      -H "Authorization: Bearer $MANAGEMENT_KEY" \
+      -H 'Accept: application/json' -H 'Content-Type: application/json' \
+      --data "$body")" || status="000"
+  else
+    status="$(curl -sS -o "$response_file" -w '%{http_code}' \
+      -X "$method" "$BASE_URL$PLUGIN_PATH$path" \
+      -H "Authorization: Bearer $MANAGEMENT_KEY" \
+      -H 'Accept: application/json')" || status="000"
+  fi
+  API_STATUS="$status"
+  API_BODY="$(cat "$response_file")"
+  rm -f "$response_file"
+  if [[ "$status" != 2* ]]; then
+    printf '%s\n' "$API_BODY" >&2
+    die "CPA request failed (HTTP $status)"
+  fi
+}
+
+print_inventory() {
+  local accounts invalid fresh queue healthy unavailable disabled
+  accounts="$(printf '%s' "$API_BODY" | json_value 'v.get("accounts", [])')"
+  invalid="$(printf '%s' "$API_BODY" | json_value 'v.get("invalid", 0)')"
+  fresh="$(printf '%s' "$API_BODY" | json_value 'v.get("fresh", 0)')"
+  queue="$(printf '%s' "$API_BODY" | json_value 'v.get("repair_queue", [])')"
+  healthy="$(printf '%s' "$accounts" | json_value 'len([a for a in v if a.get("status")=="healthy"])')"
+  unavailable="$(printf '%s' "$accounts" | json_value 'len([a for a in v if a.get("status")=="unavailable"])')"
+  disabled="$(printf '%s' "$accounts" | json_value 'len([a for a in v if a.get("status")=="disabled"])')"
+  printf 'Accounts: %s | healthy: %s | unavailable: %s | disabled: %s | invalid: %s | fresh: %s\n' \
+    "$(printf '%s' "$accounts" | json_value 'len(v)')" "$healthy" "$unavailable" "$disabled" "$invalid" "$fresh"
+  printf '%s\n' "$accounts" | python3 -c 'import json,sys
+for row in json.load(sys.stdin):
+    print("{email}  {seat}  {status}  quota={quota}".format(**row))'
+  if [[ "$queue" != "[]" && -n "$queue" ]]; then
+    printf 'Unresolved queue:\n%s\n' "$queue"
+  fi
+}
+
+open_oauth() {
+  local url="$1"
+  # The management response escapes query separators for HTML. Decode only
+  # that one entity layer before handing the URL to the browser.
+  url="${url//&amp;/&}"
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    open -a 'Google Chrome' "$url" >/dev/null 2>&1 || open "$url" >/dev/null 2>&1 || \
+      printf 'Open this OAuth URL in regular Chrome.\n' >&2
+  else
+    open "$url" >/dev/null 2>&1 || printf 'Open the OAuth URL in Chrome.\n' >&2
+  fi
+}
+
+status_command() {
+  require_key
+  api POST /scan
+  print_inventory
+}
+
+otp_command() {
+  require_key
+  api GET /otp/status
+  printf '%s\n' "$API_BODY"
+}
+
+follow_repair_job() {
+  local job_id="$1" label="${2:-Repair}" state last_attempt='' last_progress='' oauth_url email seat attempt reason encoded_job progress
+  encoded_job="$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1],safe=""))' "$job_id")"
+  printf '%s\n' "$label"
+  while :; do
+    api POST "/revive/poll?id=$encoded_job"
+    state="$(printf '%s' "$API_BODY" | json_value 'v.get("state", "")')"
+    email="$(printf '%s' "$API_BODY" | json_value 'v.get("email", v.get("current_email", ""))')"
+    seat="$(printf '%s' "$API_BODY" | json_value 'v.get("seat", v.get("current_seat", ""))')"
+    attempt="$(printf '%s' "$API_BODY" | json_value 'v.get("attempt", "")')"
+    oauth_url="$(printf '%s' "$API_BODY" | json_value 'v.get("oauth_url", "")')"
+    reason="$(printf '%s' "$API_BODY" | json_value 'v.get("reason", "")')"
+    progress="$state|$email|$seat"
+    if [[ "$progress" != "$last_progress" ]]; then
+      last_progress="$progress"
+      printf 'Queue: %s%s%s\n' "$state" "${email:+ · $email}" "${seat:+ · $seat}"
+    fi
+    if [[ -n "$attempt" && "$attempt" != "$last_attempt" ]]; then
+      last_attempt="$attempt"
+      printf 'OAuth needed for %s (%s). Phoenix will validate the workspace after login.\n' "$email" "$seat"
+      [[ -n "$oauth_url" ]] && open_oauth "$oauth_url"
+    fi
+    case "$state" in
+      completed)
+        printf 'Repair completed.\n'
+        return 0
+        ;;
+      failed|cancelled)
+        printf 'Repair %s%s.\n' "$state" "${reason:+: $reason}" >&2
+        return 1
+        ;;
+    esac
+    sleep "$POLL_SECONDS"
+  done
+}
+
+repair_command() {
+  require_key
+  local job_id active kind
+  api POST /scan
+  active="$(printf '%s' "$API_BODY" | json_value 'v.get("active_job") or {}')"
+  kind="$(printf '%s' "$active" | json_value 'v.get("kind", "")')"
+  if [[ "$kind" == "revive" ]]; then
+    job_id="$(printf '%s' "$active" | json_value 'v.get("id")')"
+    follow_repair_job "$job_id" 'Resuming active repair job.'
+    return $?
+  fi
+  api POST /revive '{"acknowledge":"CPA_PHOENIX_ONE_CLICK","browser_mode":"agent"}'
+  job_id="$(printf '%s' "$API_BODY" | json_value 'v.get("job_id")')"
+  [[ -n "$job_id" ]] || die 'Phoenix did not return a repair job id'
+  follow_repair_job "$job_id" 'Repair job started.'
+}
+
+recover_command() {
+  require_key
+  [[ $# -gt 0 ]] || die 'recover requires at least one seat label'
+  local payload job_id seats_json
+  seats_json="$(printf '%s\n' "$@" | python3 -c 'import json,sys; print(json.dumps([line.strip() for line in sys.stdin if line.strip()]))')"
+  payload="$(python3 -c 'import json,sys; print(json.dumps({"acknowledge":"CPA_PHOENIX_ONE_CLICK","browser_mode":"agent","seats":json.loads(sys.argv[1])},separators=(",",":")))' "$seats_json")"
+  api POST /revive/recover "$payload"
+  job_id="$(printf '%s' "$API_BODY" | json_value 'v.get("job_id")')"
+  [[ -n "$job_id" ]] || die 'Phoenix did not return a recovery job id'
+  follow_repair_job "$job_id" 'Resuming selected repair rows.'
+}
+
+code_command() {
+  require_key
+  local job_id="$1" attempt="$2" encoded_job encoded_attempt
+  encoded_job="$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1],safe=""))' "$job_id")"
+  encoded_attempt="$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1],safe=""))' "$attempt")"
+  api POST "/revive/code?id=$encoded_job&attempt=$encoded_attempt"
+  printf '%s\n' "$API_BODY"
+}
+
+skip_command() {
+  require_key
+  local job_id="$1" attempt="$2"
+  api POST /revive/skip "{\"job_id\":\"$job_id\",\"attempt\":\"$attempt\",\"reason\":\"provider_auth_error\"}"
+  printf '%s\n' "$API_BODY"
+}
+
+pause_command() {
+  require_key
+  local job_id="$1" attempt="$2"
+  api POST /revive/skip "{\"job_id\":\"$job_id\",\"attempt\":\"$attempt\",\"reason\":\"workspace_missing\"}"
+  printf '%s\n' "$API_BODY"
+}
+
+cancel_command() {
+  require_key
+  local job_id="$1" encoded_job
+  encoded_job="$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1],safe=""))' "$job_id")"
+  api POST "/revive/cancel?id=$encoded_job"
+  printf '%s\n' "$API_BODY"
+}
+
+need_command curl
+need_command python3
+
+command_name=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --key) [[ $# -ge 2 ]] || die '--key requires a value'; MANAGEMENT_KEY="$2"; shift 2 ;;
+    --key-file) [[ $# -ge 2 ]] || die '--key-file requires a path'; MANAGEMENT_KEY="$(<"$2")"; shift 2 ;;
+    --url) [[ $# -ge 2 ]] || die '--url requires a value'; BASE_URL="${2%/}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    status|inventory) command_name=status; shift; break ;;
+    otp) command_name=otp; shift; break ;;
+    repair|revive) command_name=repair; shift; break ;;
+    recover) command_name=recover; shift; break ;;
+    code) command_name=code; shift; break ;;
+    skip) command_name=skip; shift; break ;;
+    pause) command_name=pause; shift; break ;;
+    cancel) command_name=cancel; shift; break ;;
+    *) usage >&2; die "unknown option or command: $1" ;;
+  esac
+done
+
+case "$command_name" in
+  status) [[ $# -eq 0 ]] || die 'status takes no arguments'; status_command ;;
+  otp) [[ $# -eq 0 ]] || die 'otp takes no arguments'; otp_command ;;
+  repair) [[ $# -eq 0 ]] || die 'repair takes no arguments'; repair_command ;;
+  recover) recover_command "$@" ;;
+  code) [[ $# -eq 2 ]] || die 'code requires JOB and ATTEMPT'; code_command "$1" "$2" ;;
+  skip) [[ $# -eq 2 ]] || die 'skip requires JOB and ATTEMPT'; skip_command "$1" "$2" ;;
+  pause) [[ $# -eq 2 ]] || die 'pause requires JOB and ATTEMPT'; pause_command "$1" "$2" ;;
+  cancel) [[ $# -eq 1 ]] || die 'cancel requires JOB'; cancel_command "$1" ;;
+  *) usage >&2; die 'a command is required' ;;
+esac

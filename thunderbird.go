@@ -43,6 +43,9 @@ type thunderbirdCode struct {
 	Code       string
 	ReceivedAt time.Time
 	Recipient  string
+	// Source is runtime-only metadata used to expose a sanitized fallback
+	// status. It is never persisted or returned with mailbox contents.
+	Source string
 }
 
 type thunderbirdCandidate struct {
@@ -455,7 +458,7 @@ func detectThunderbirdCode(recipient string, requestedAt time.Time) (thunderbird
 	for _, path := range mailboxFilesForRecipient(profile, recipient) {
 		for _, raw := range readThunderbirdMailbox(path) {
 			candidate, ok := parseThunderbirdMessage(raw)
-			if !ok || candidate.ReceivedAt.IsZero() || !candidate.ReceivedAt.After(requestedAt) || len(candidate.Recipients) != 1 || !strings.EqualFold(candidate.Recipient, recipient) {
+			if !ok || candidate.ReceivedAt.IsZero() || !candidate.ReceivedAt.After(requestedAt) || candidate.ReceivedAt.After(time.Now().Add(30*time.Second)) || len(candidate.Recipients) != 1 || !strings.EqualFold(candidate.Recipient, recipient) {
 				continue
 			}
 			candidates = append(candidates, candidate)

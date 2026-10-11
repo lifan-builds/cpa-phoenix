@@ -46,6 +46,11 @@ resend.onclick=()=>fetch('/resent?attempt=%d');</script>`, want, attempt, attemp
 <label><input type="radio" name="workspace" value="personal">Personal</label>
 <label><input type="radio" name="workspace" value="workspace-%d"%s>Team %d</label>
 <button id="choose">Continue</button><script>choose.onclick=()=>{const e=document.querySelector(':checked');if(e)fetch('/selected?attempt=%d&id='+encodeURIComponent(e.value)).then(()=>location='/auth/callback?code=fixture')}</script>`, shownEmail, attempt, disabled, attempt, attempt)
+	case "/workspace-cards":
+		fmt.Fprintf(w, `<!doctype html><h1>Choose your workspace</h1><p>same@example.test</p>
+<label><button type="button" id="team-one">Team One</button></label>
+<label><button type="button" id="team-two">Team Two</button></label>
+<button id="choose">Continue</button><script>let selected='';document.getElementById('team-one').onclick=()=>selected='Team One';document.getElementById('team-two').onclick=()=>selected='Team Two';document.getElementById('choose').onclick=()=>{if(selected)fetch('/selected?attempt=%d&id='+encodeURIComponent(selected)).then(()=>location='/auth/callback?code=fixture')}</script>`, attempt)
 	case "/password-method":
 		fmt.Fprintf(w, `<!doctype html><input type="password" name="password"><button id="email-code">Email me a one-time code</button><script>document.getElementById('email-code').onclick=()=>location='/otp?attempt=%d'</script>`, attempt)
 	case "/resent":
@@ -100,9 +105,6 @@ func TestLoginBrowserSequentialWorkspaceFlowAndFreshResend(t *testing.T) {
 	}
 	b := newFixtureLoginBrowser(t, detector)
 	b.resendAfter = 50 * time.Millisecond
-	var thunderbirdLaunches atomic.Int32
-	b.launchThunderbird = func() { thunderbirdLaunches.Add(1) }
-
 	for _, tc := range []struct {
 		attempt int
 		cutoff  time.Time
@@ -132,9 +134,6 @@ func TestLoginBrowserSequentialWorkspaceFlowAndFreshResend(t *testing.T) {
 	if fixture.resends[2] != 1 {
 		t.Fatalf("second attempt should resend exactly once, got %d", fixture.resends[2])
 	}
-	if got := thunderbirdLaunches.Load(); got != 2 {
-		t.Fatalf("Thunderbird should be reopened for each login attempt, got %d launches", got)
-	}
 }
 
 func TestLoginBrowserRefusesUnknownWorkspace(t *testing.T) {
@@ -161,6 +160,60 @@ func TestLoginBrowserRefusesUnknownWorkspace(t *testing.T) {
 	defer fixture.mu.Unlock()
 	if selected := fixture.selected[3]; selected != "" {
 		t.Fatalf("controller selected an unrequested workspace %q", selected)
+	}
+}
+
+func TestLoginBrowserWorkspaceTrialSkipsPersonalAndCapturesName(t *testing.T) {
+	fixture := &loginFixture{selected: make(map[int]string), resends: make(map[int]int)}
+	server := httptest.NewServer(http.HandlerFunc(fixture.handler))
+	defer server.Close()
+	b := newFixtureLoginBrowser(t, func(_ string, _ time.Time) (thunderbirdCode, error) {
+		return thunderbirdCode{Code: "000007", ReceivedAt: time.Now()}, nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	var statuses []string
+	err := b.runWorkspace(ctx, server.URL+"/start?attempt=7", "same@example.test", "workspace-not-present", "Team 7", 0, time.Now().Add(-time.Second), func(status string) {
+		statuses = append(statuses, status)
+	}, true)
+	if err != nil {
+		t.Fatalf("workspace trial failed: %v (statuses %v)", err, statuses)
+	}
+	if !containsStatus(statuses, "workspace_selected") || !containsStatus(statuses, "workspace_name:Team 7") {
+		t.Fatalf("workspace trial did not report its visible label: %v", statuses)
+	}
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if fixture.selected[7] != "workspace-7" {
+		t.Fatalf("workspace trial selected the wrong choice: %#v", fixture.selected)
+	}
+}
+
+func TestLoginBrowserWorkspaceTrialTriesCardsWithoutOpaqueIDs(t *testing.T) {
+	fixture := &loginFixture{selected: make(map[int]string), resends: make(map[int]int)}
+	server := httptest.NewServer(http.HandlerFunc(fixture.handler))
+	defer server.Close()
+	b := newFixtureLoginBrowser(t, func(_ string, _ time.Time) (thunderbirdCode, error) {
+		return thunderbirdCode{Code: "000008", ReceivedAt: time.Now()}, nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	var statuses []string
+	err := b.runWorkspace(ctx, server.URL+"/workspace-cards?attempt=8", "same@example.test", "workspace-not-present", "", 1, time.Now().Add(-time.Second), func(status string) {
+		statuses = append(statuses, status)
+	}, true)
+	if err != nil {
+		t.Fatalf("workspace card trial failed: %v (statuses %v)", err, statuses)
+	}
+	if !containsStatus(statuses, "workspace_selected") || !containsStatus(statuses, "workspace_name:Team Two") {
+		t.Fatalf("workspace card trial did not select the requested trial: %v", statuses)
+	}
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if fixture.selected[8] != "Team Two" {
+		t.Fatalf("workspace card trial selected the wrong choice: %#v", fixture.selected)
 	}
 }
 

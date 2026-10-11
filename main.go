@@ -69,6 +69,14 @@ type capabilities struct {
 	ManagementAPI bool `json:"management_api"`
 	Scheduler     bool `json:"scheduler"`
 }
+
+// Phoenix owns management routes and internal background work. It must never
+// advertise the CPA proxy Scheduler capability: that capability makes CPA
+// send inference requests through the plugin C-ABI method dispatcher.
+func phoenixCapabilities() capabilities {
+	return capabilities{ManagementAPI: true}
+}
+
 type managementRegistrationResponse struct {
 	Routes    []managementRoute `json:"routes"`
 	Resources []resourceRoute   `json:"resources"`
@@ -147,7 +155,9 @@ func cliproxyPluginFree(ptr unsafe.Pointer, _ C.size_t) {
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
 	stopIgniteScheduler()
+	stopQuotaFloorScheduler()
 	stopAllRevive()
+	closeAgentAutofillClient()
 	globalJobs.stop()
 	closeStore()
 }
@@ -216,9 +226,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			return nil, errors.New("invalid lifecycle request")
 		}
 		startIgniteScheduler()
-		return okJSON(pluginRegisterResponse{SchemaVersion: 1, Metadata: pluginMetadata{Name: "CPA Phoenix", Version: pluginVersion, Author: "lifan-builds", GitHubRepository: "https://github.com/lifan-builds/cpa-phoenix"}, Capabilities: capabilities{ManagementAPI: true}}), nil
+		startQuotaFloorScheduler()
+		return okJSON(pluginRegisterResponse{SchemaVersion: 1, Metadata: pluginMetadata{Name: "CPA Phoenix", Version: pluginVersion, Author: "lifan-builds", GitHubRepository: "https://github.com/lifan-builds/cpa-phoenix"}, Capabilities: phoenixCapabilities()}), nil
 	case "management.register":
-		return okJSON(managementRegistrationResponse{Routes: []managementRoute{{"POST", "/plugins/cpa-phoenix/scan", "Refresh sanitized account counts."}, {"GET", "/plugins/cpa-phoenix/state", "Read sanitized job state."}, {"POST", "/plugins/cpa-phoenix/ignite", "Ignite all fresh accounts once."}, {"GET", "/plugins/cpa-phoenix/ignite/schedule", "Read the daily Ignite schedule."}, {"POST", "/plugins/cpa-phoenix/ignite/schedule", "Configure the daily Ignite schedule."}, {"POST", "/plugins/cpa-phoenix/revive", "Revive all invalid accounts sequentially."}, {"POST", "/plugins/cpa-phoenix/revive/poll", "Advance the guided repair."}, {"POST", "/plugins/cpa-phoenix/revive/code", "Read a fresh verification code from Thunderbird."}, {"POST", "/plugins/cpa-phoenix/revive/cancel", "Cancel the guided repair."}}, Resources: []resourceRoute{{"/dashboard", "Phoenix", "Fresh-account activation and invalid-auth repair."}}}), nil
+		return okJSON(managementRegistrationResponse{Routes: []managementRoute{{"POST", "/plugins/cpa-phoenix/scan", "Refresh sanitized account counts."}, {"GET", "/plugins/cpa-phoenix/state", "Read sanitized job state."}, {"GET", "/plugins/cpa-phoenix/otp/status", "Read the local Agent Autofill connector status."}, {"POST", "/plugins/cpa-phoenix/ignite", "Ignite all fresh accounts once."}, {"GET", "/plugins/cpa-phoenix/ignite/schedule", "Read the daily Ignite schedule."}, {"POST", "/plugins/cpa-phoenix/ignite/schedule", "Configure the daily Ignite schedule."}, {"GET", "/plugins/cpa-phoenix/quota-floor", "Read the Codex quota-floor controller."}, {"POST", "/plugins/cpa-phoenix/quota-floor", "Configure the Codex quota-floor controller."}, {"POST", "/plugins/cpa-phoenix/revive", "Revive all invalid accounts sequentially."}, {"POST", "/plugins/cpa-phoenix/revive/recover", "Retry explicitly selected paused or timed-out repair rows in regular Chrome."}, {"POST", "/plugins/cpa-phoenix/revive/poll", "Advance the guided repair."}, {"POST", "/plugins/cpa-phoenix/revive/code", "Read a fresh verification code from Agent Autofill."}, {"POST", "/plugins/cpa-phoenix/revive/skip", "Pause or skip the current agent OAuth attempt and continue the queue."}, {"POST", "/plugins/cpa-phoenix/revive/cancel", "Cancel the guided repair."}}, Resources: []resourceRoute{{"/dashboard", "Phoenix", "Fresh-account activation, quota protection, and invalid-auth repair."}}}), nil
 	case "management.handle":
 		var req managementRequest
 		if err := json.Unmarshal(request, &req); err != nil {
@@ -256,8 +267,20 @@ func routeManagement(req managementRequest) managementResponse {
 			if !a.Physical {
 				continue
 			}
+			// The host list intentionally omits the private ChatGPT account ID.
+			// Hydrate it ephemerally before projecting the opaque seat label so a
+			// restart cannot relabel the same physical account from a transient
+			// auth index or filename.
+			if a.AccountID == "" {
+				a = refreshCredential(a)
+			}
 			if a.Physical && !a.Disabled && !a.Expired && !a.Unavailable {
 				a = refreshQuota(a)
+				if a.QuotaError != "" || a.QuotaStatusCode < http.StatusOK || a.QuotaStatusCode >= http.StatusMultipleChoices {
+					// A failed scan must not retain an old fresh projection and
+					// advertise an Ignite-eligible account.
+					a.Quota = quotaSnapshot{}
+				}
 			}
 			invalidRecord := invalidAuthDecision(a)
 			if scanFreshEligible(a, now) {
@@ -285,8 +308,12 @@ func routeManagement(req managementRequest) managementResponse {
 			rows = append(rows, map[string]any{"number": len(rows) + 1, "email": a.Email, "seat": stableSeatLabel(a), "status": status, "quota": quotaState})
 		}
 		return jsonResponse(200, map[string]any{"fresh": fresh, "invalid": invalid, "active": anyJobActive(), "active_job": activeJobProjection(), "last_job": latestJobProjection(), "accounts": rows, "repair_queue": incompleteRepairQueue()})
+	case path == "/otp/status" && req.Method == http.MethodGet:
+		return jsonResponse(http.StatusOK, mailSourceStatus())
 	case path == "/ignite/schedule":
 		return handleIgniteScheduleManagement(req)
+	case path == "/quota-floor":
+		return handleQuotaFloorManagement(req)
 	case path == "/ignite" && req.Method == http.MethodPost:
 		if !acknowledged(req.Body) {
 			return jsonResponse(400, map[string]string{"error": "acknowledgement_required"})
@@ -325,7 +352,35 @@ func routeManagement(req managementRequest) managementResponse {
 			if errors.Is(err, errInvalidBrowserMode) {
 				return jsonResponse(http.StatusBadRequest, map[string]string{"error": "invalid_browser_mode"})
 			}
-			return jsonResponse(409, map[string]string{"error": "job_active"})
+			if errors.Is(err, errIgniteJobActive) {
+				return jsonResponse(http.StatusConflict, map[string]string{"error": "job_active"})
+			}
+			return jsonResponse(http.StatusServiceUnavailable, map[string]string{"error": "inventory_unavailable"})
+		}
+		return jsonResponse(202, result)
+	case path == "/revive/recover" && req.Method == http.MethodPost:
+		if !acknowledged(req.Body) {
+			return jsonResponse(http.StatusBadRequest, map[string]string{"error": "acknowledgement_required"})
+		}
+		var body struct {
+			BrowserMode string   `json:"browser_mode"`
+			Seats       []string `json:"seats"`
+		}
+		if err := json.Unmarshal(req.Body, &body); err != nil || strings.ToLower(strings.TrimSpace(body.BrowserMode)) != reviveBrowserModeAgent {
+			return jsonResponse(http.StatusBadRequest, map[string]string{"error": "agent_mode_required"})
+		}
+		result, err := recoverTimedOutRevive(req.Headers, body.Seats)
+		if err != nil {
+			switch {
+			case errors.Is(err, errNoRecoverableSkippedAccounts):
+				return jsonResponse(http.StatusConflict, map[string]string{"error": "no_recoverable_accounts"})
+			case errors.Is(err, errIgniteJobActive):
+				return jsonResponse(http.StatusConflict, map[string]string{"error": "job_active"})
+			case errors.Is(err, errRecoverySeatMismatch):
+				return jsonResponse(http.StatusBadRequest, map[string]string{"error": "seat_mismatch"})
+			default:
+				return jsonResponse(http.StatusServiceUnavailable, map[string]string{"error": "recovery_unavailable"})
+			}
 		}
 		return jsonResponse(202, result)
 	case path == "/state" && req.Method == http.MethodGet:
@@ -346,7 +401,21 @@ func routeManagement(req managementRequest) managementResponse {
 		return revivePoll(id)
 	case path == "/revive/code" && req.Method == http.MethodPost:
 		id := firstQuery(req.Query, "id", "")
-		return reviveCode(id)
+		attempt := firstQuery(req.Query, "attempt", "")
+		if attempt == "" {
+			return jsonResponse(http.StatusBadRequest, map[string]string{"error": "attempt_required"})
+		}
+		return reviveCode(id, attempt)
+	case path == "/revive/skip" && req.Method == http.MethodPost:
+		var body struct {
+			JobID   string `json:"job_id"`
+			Attempt string `json:"attempt"`
+			Reason  string `json:"reason"`
+		}
+		if err := json.Unmarshal(req.Body, &body); err != nil {
+			return jsonResponse(http.StatusBadRequest, map[string]string{"error": "bad_request"})
+		}
+		return reviveSkip(body.JobID, body.Attempt, body.Reason)
 	case path == "/revive/cancel" && req.Method == http.MethodPost:
 		id := firstQuery(req.Query, "id", "")
 		if id == "" {

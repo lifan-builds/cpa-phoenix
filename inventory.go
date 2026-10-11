@@ -82,7 +82,14 @@ type account struct {
 	RepairState     string
 	Quarantine      string
 	SeatLabel       string
+	// WorkspaceName is the provider-visible display name captured during a
+	// successful OAuth workspace choice. It is a hint for future choices, never
+	// a private identity or proof of ownership.
+	WorkspaceName   string
 	QuotaStatusCode int
+	// QuotaError is an ephemeral, sanitized reason for the most recent probe.
+	// Provider bodies and credentials never enter the account projection.
+	QuotaError string
 }
 
 func stableSeatLabel(a account) string {
@@ -437,11 +444,14 @@ func exactRepairEmail(candidate, expected string) bool {
 }
 
 func refreshQuota(a account) account {
-	// Status belongs only to this probe; a transport failure must not reuse a
-	// previous response from the same in-memory account value.
+	// Status belongs only to this probe. Quota-floor callers clear their
+	// projection before invoking this helper so failed probes cannot reuse it;
+	// other callers may intentionally retain their last projection for eligibility.
 	a.QuotaStatusCode = 0
+	a.QuotaError = ""
 	token, accountID, ok := hostCredential(a)
 	if !ok {
+		a.QuotaError = "credential_unavailable"
 		return a
 	}
 	if a.AccountID == "" {
@@ -449,6 +459,7 @@ func refreshQuota(a account) account {
 	}
 	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, codexQuotaUsageURL, nil)
 	if err != nil {
+		a.QuotaError = "quota_request_invalid"
 		return a
 	}
 	request.Header.Set("Authorization", "Bearer "+token)
@@ -460,6 +471,7 @@ func refreshQuota(a account) account {
 	client := &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
 	response, err := client.Do(request)
 	if err != nil {
+		a.QuotaError = "quota_transport_failed"
 		return a
 	}
 	defer response.Body.Close()
@@ -467,8 +479,13 @@ func refreshQuota(a account) account {
 	// is parsed for quota freshness and never retained.
 	a.QuotaStatusCode = response.StatusCode
 	body, _ := io.ReadAll(io.LimitReader(response.Body, 2<<20))
-	if response.StatusCode >= 200 && response.StatusCode < 300 {
-		a.Quota = parseCodexQuotaPayload(body, time.Now().Unix())
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		a.QuotaError = "quota_http_status"
+		return a
+	}
+	a.Quota = parseCodexQuotaPayload(body, time.Now().Unix())
+	if len(quotaWindows(a.Quota)) == 0 {
+		a.QuotaError = "quota_payload_invalid"
 	}
 	return a
 }

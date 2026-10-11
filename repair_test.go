@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -351,6 +352,75 @@ func TestRepairRowsOverlapRequiresExactPrivateIdentityAndEmail(t *testing.T) {
 	}
 }
 
+func TestRepairWorkspaceNameCarriesForwardByPrivateIdentity(t *testing.T) {
+	db, _ := setupRepairRecoveryStore(t)
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO jobs(id,kind,state,created_at,updated_at,total,done) VALUES(?,?,?,?,?,?,?)`, "named-history", "revive", "completed", now, now, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO repair_rows(job_id,ordinal,account_key,email,account_id,workspace_name,state) VALUES(?,?,?,?,?,?,?)`, "named-history", 1, "old-key", "owner@example.test", "workspace-a", "Team Alpha", "repaired"); err != nil {
+		t.Fatal(err)
+	}
+	id, err := globalJobs.startRevive([]account{{Key: "new-key", Email: "OWNER@example.test", AccountID: "workspace-a"}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	updateJob(id, "completed", "", 1)
+	rows, err := loadRepairRows(id)
+	if err != nil || len(rows) != 1 || rows[0].WorkspaceName != "Team Alpha" {
+		t.Fatalf("workspace name was not carried forward: rows=%+v err=%v", rows, err)
+	}
+}
+
+func TestReviveRetriesWhenFirstWorkspaceCallbackIsNotTheQueuedSeat(t *testing.T) {
+	db, _ := setupRepairRecoveryStore(t)
+	jobID := "workspace-trial-retry"
+	seedRepairRecoveryState(t, db, jobID, "running", "queued", "")
+	expected := account{Key: "seat-a", AuthIndex: "index-a", AccountID: "workspace-a", Email: "owner@example.test", AuthPath: "/auth/a.json", AuthDir: "/auth", Physical: true, Status: "authentication_error"}
+	if _, err := db.Exec(`UPDATE repair_rows SET account_id=?,auth_index=? WHERE job_id=? AND ordinal=1`, expected.AccountID, expected.AuthIndex, jobID); err != nil {
+		t.Fatal(err)
+	}
+	wrong := account{Key: "wrong", AuthIndex: "wrong-index", AccountID: "workspace-wrong", Email: expected.Email, AuthPath: "/auth/wrong.json", AuthDir: "/auth", Physical: true, AccessTokenValue: "wrong-token"}
+	right := expected
+	right.Status = "active"
+	right.AccessTokenValue = "right-token"
+	oldInventory, oldStart, oldPoll, oldQuota, oldWait := repairListAccounts, repairStartNativeOAuth, repairPollNativeOAuth, repairRefreshQuota, repairReplacementWaitLimit
+	listCalls := 0
+	oauthStarts := 0
+	repairListAccounts = func() ([]account, error) {
+		listCalls++
+		if listCalls <= 2 {
+			return []account{expected}, nil
+		}
+		if listCalls <= 3 {
+			return []account{wrong}, nil
+		}
+		return []account{right}, nil
+	}
+	repairStartNativeOAuth = func(context.Context, string, string) (nativeOAuthStart, error) {
+		oauthStarts++
+		return nativeOAuthStart{URL: "https://login.example.test/authorize", State: fmt.Sprintf("trial-%d", oauthStarts)}, nil
+	}
+	repairPollNativeOAuth = func(context.Context, string, string) (string, error) { return "success", nil }
+	repairRefreshQuota = func(a account) account {
+		if a.AccessTokenValue != "" {
+			a.QuotaStatusCode = http.StatusOK
+			a.Quota = quotaSnapshot{Windows: []quotaWindow{{Presence: windowPresent}}}
+		}
+		return a
+	}
+	repairReplacementWaitLimit = 5 * time.Millisecond
+	t.Cleanup(func() {
+		repairListAccounts, repairStartNativeOAuth, repairPollNativeOAuth, repairRefreshQuota, repairReplacementWaitLimit = oldInventory, oldStart, oldPoll, oldQuota, oldWait
+	})
+	runtime := &reviveRuntime{jobID: jobID, queued: []account{expected}, browserMode: reviveBrowserModeAgent}
+	runReviveQueue(runtime)
+	job, err := readJob(jobID)
+	if err != nil || job.State != "completed" || job.Done != 1 || oauthStarts != 2 {
+		t.Fatalf("workspace trial did not continue to the matching callback: job=%+v starts=%d err=%v", job, oauthStarts, err)
+	}
+}
+
 func TestBeginReviveSupersedesDisjointTerminalQueueAndPreservesRows(t *testing.T) {
 	db, _ := setupRepairRecoveryStore(t)
 	oldID := "old-revive"
@@ -541,6 +611,68 @@ func TestSupersededReviveIsExcludedFromQueueAfterStoreReopen(t *testing.T) {
 	}
 }
 
+func TestIncompleteRepairQueueProjectsOlderSkippedHistoryAfterLatestCompletes(t *testing.T) {
+	db, _ := setupRepairRecoveryStore(t)
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO jobs(id,kind,state,created_at,updated_at,total,done) VALUES(?,?,?,?,?,?,?)`, "old-skipped", "revive", "failed", now, now, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO repair_rows(job_id,ordinal,account_key,email,account_id,state,quarantine) VALUES(?,?,?,?,?,?,?)`, "old-skipped", 1, "old-key", "old@example.test", "old-account", "skipped", "opaque-old"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO jobs(id,kind,state,created_at,updated_at,total,done) VALUES(?,?,?,?,?,?,?)`, "new-completed", "revive", "completed", now+1, now+1, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO repair_rows(job_id,ordinal,account_key,email,account_id,state) VALUES(?,?,?,?,?,'repaired')`, "new-completed", 1, "new-key", "new@example.test", "new-account"); err != nil {
+		t.Fatal(err)
+	}
+	queue := incompleteRepairQueue()
+	if len(queue) != 1 || queue[0]["email"] != "old@example.test" || queue[0]["state"] != "skipped" || queue[0]["quarantined"] != true {
+		t.Fatalf("older skipped history was not projected after latest completion: %v", queue)
+	}
+}
+
+func TestIncompleteRepairQueuePrefersLatestPendingQueueOverOlderSkippedHistory(t *testing.T) {
+	db, _ := setupRepairRecoveryStore(t)
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO jobs(id,kind,state,created_at,updated_at,total,done) VALUES(?,?,?,?,?,?,?)`, "old-skipped-priority", "revive", "failed", now, now, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO repair_rows(job_id,ordinal,account_key,email,account_id,state,quarantine) VALUES(?,?,?,?,?,?,?)`, "old-skipped-priority", 1, "old-key", "old@example.test", "old-account", "skipped", "opaque-old"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO jobs(id,kind,state,created_at,updated_at,total,done) VALUES(?,?,?,?,?,?,?)`, "new-pending", "revive", "failed", now+1, now+1, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO repair_rows(job_id,ordinal,account_key,email,account_id,state,quarantine) VALUES(?,?,?,?,?,?,?)`, "new-pending", 1, "new-key", "new@example.test", "new-account", "failed", "opaque-new"); err != nil {
+		t.Fatal(err)
+	}
+	queue := incompleteRepairQueue()
+	if len(queue) != 2 || queue[0]["email"] != "new@example.test" || queue[0]["state"] != "failed" || queue[1]["email"] != "old@example.test" || queue[1]["state"] != "skipped" {
+		t.Fatalf("all latest unresolved identities were not projected in order: %v", queue)
+	}
+}
+
+func TestIncompleteRepairQueueSuppressesOlderIdentityAfterRepair(t *testing.T) {
+	db, _ := setupRepairRecoveryStore(t)
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO jobs(id,kind,state,created_at,updated_at,total,done) VALUES(?,?,?,?,?,?,?)`, "old-timeout", "revive", "failed", now, now, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO repair_rows(job_id,ordinal,account_key,email,account_id,state,reason) VALUES(?,?,?,?,?,?,?)`, "old-timeout", 1, "old-key", "Owner@Example.test", "workspace-a", "skipped", "oauth_timeout"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO jobs(id,kind,state,created_at,updated_at,total,done) VALUES(?,?,?,?,?,?,?)`, "new-repaired", "revive", "completed", now+1, now+1, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO repair_rows(job_id,ordinal,account_key,email,account_id,state,reason) VALUES(?,?,?,?,?,?,?)`, "new-repaired", 1, "new-key", "owner@example.test", "workspace-a", "repaired", ""); err != nil {
+		t.Fatal(err)
+	}
+	if queue := incompleteRepairQueue(); len(queue) != 0 {
+		t.Fatalf("older unresolved outcome leaked after exact identity was repaired: %v", queue)
+	}
+}
+
 func TestLatestJobProjectionBreaksSecondResolutionTiesByCreationOrder(t *testing.T) {
 	db, _ := setupRepairRecoveryStore(t)
 	now := time.Now().Unix()
@@ -558,6 +690,56 @@ func TestLatestJobProjectionBreaksSecondResolutionTiesByCreationOrder(t *testing
 	projection := latestJobProjection()
 	if projection == nil || projection["id"] != "newer-job" {
 		t.Fatalf("latest job projection did not use insertion tie-break: %+v", projection)
+	}
+}
+
+func TestRepairJobSummaryAndQueueExposeUnresolvedReason(t *testing.T) {
+	db, _ := setupRepairRecoveryStore(t)
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO jobs(id,kind,state,created_at,updated_at,total,done) VALUES(?,?,?,?,?,?,?)`, "summary-job", "revive", "failed", now, now, 3, 1); err != nil {
+		t.Fatal(err)
+	}
+	rows := []struct {
+		ordinal int
+		state   string
+		reason  string
+		quar    string
+	}{
+		{1, "repaired", "", ""},
+		{2, "skipped", "provider_auth_error", ""},
+		{3, "skipped", "oauth_timeout", "q-3"},
+	}
+	for _, row := range rows {
+		if _, err := db.Exec(`INSERT INTO repair_rows(job_id,ordinal,email,account_id,account_key,state,reason,quarantine) VALUES(?,?,?,?,?,?,?,?)`, "summary-job", row.ordinal, fmt.Sprintf("seat-%d@example.test", row.ordinal), fmt.Sprintf("account-%d", row.ordinal), fmt.Sprintf("key-%d", row.ordinal), row.state, row.reason, row.quar); err != nil {
+			t.Fatal(err)
+		}
+	}
+	summary := repairJobSummary("summary-job")
+	if summary["repaired"] != 1 || summary["skipped"] != 2 || summary["unresolved"] != 2 {
+		t.Fatalf("unexpected repair summary: %#v", summary)
+	}
+	queue := incompleteRepairQueue()
+	if len(queue) != 2 || queue[0]["reason"] != "provider_auth_error" || queue[1]["recoverable"] != true {
+		t.Fatalf("queue did not expose unresolved reasons: %#v", queue)
+	}
+}
+
+func TestAgentTimeoutWithoutQuarantineRemainsRecoverable(t *testing.T) {
+	db, _ := setupRepairRecoveryStore(t)
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO jobs(id,kind,state,created_at,updated_at,total,done) VALUES(?,?,?,?,?,?,?)`, "agent-timeout", "revive", "failed", now, now, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO repair_rows(job_id,ordinal,email,account_id,account_key,state,reason,quarantine) VALUES(?,?,?,?,?,?,?,?)`, "agent-timeout", 1, "agent@example.test", "agent-account", "agent-key", "skipped", "oauth_timeout", ""); err != nil {
+		t.Fatal(err)
+	}
+	queue := incompleteRepairQueue()
+	if len(queue) != 1 || queue[0]["recoverable"] != true || queue[0]["quarantined"] != false {
+		t.Fatalf("agent timeout should be retryable without quarantine: %v", queue)
+	}
+	snapshot, ok, err := latestRecoverableReviveJob()
+	if err != nil || !ok || snapshot.ID != "agent-timeout" {
+		t.Fatalf("recoverable historical timeout was not selected: snapshot=%+v ok=%v err=%v", snapshot, ok, err)
 	}
 }
 
@@ -728,6 +910,97 @@ func TestReviveQueueRoutesSameEmailOAuthToTheWorkspaceActuallyReturned(t *testin
 	t.Run("agent", func(t *testing.T) { testReviveWorkspaceQueue(t, reviveBrowserModeAgent) })
 }
 
+func TestAgentReviveContinuesAfterTransientFailureWithoutQuarantine(t *testing.T) {
+	db, _ := setupRepairRecoveryStore(t)
+	jobID := "repair-agent-transient-continue"
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO jobs(id,kind,state,created_at,updated_at,total,done) VALUES(?,?,?,?,?,?,?)`, jobID, "revive", "running", now, now, 2, 0); err != nil {
+		t.Fatal(err)
+	}
+	first := account{Key: "seat-one", AuthID: "auth-one", AuthIndex: "index-one", AccountID: "workspace-one", Email: "one@example.test", AuthPath: "/auth/one.json", AuthDir: "/auth", Physical: true, Status: "authentication_error"}
+	second := account{Key: "seat-two", AuthID: "auth-two", AuthIndex: "index-two", AccountID: "workspace-two", Email: "two@example.test", AuthPath: "/auth/two.json", AuthDir: "/auth", Physical: true, Status: "authentication_error"}
+	for i, row := range []account{first, second} {
+		if _, err := db.Exec(`INSERT INTO repair_rows(job_id,ordinal,account_key,auth_id,auth_index,email,account_id,state) VALUES(?,?,?,?,?,?,?,'queued')`, jobID, i+1, row.Key, row.AuthID, row.AuthIndex, row.Email, row.AccountID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	secondReplacement := second
+	secondReplacement.Status = "active"
+	secondReplacement.AccessTokenValue = "replacement-token"
+	secondReplacement.AccountID = "" // host.auth.list omits the private workspace ID.
+
+	oldList, oldQuarantine, oldBind := repairListAccounts, repairSafeQuarantine, repairBindCallbackForwarder
+	oldCapture := repairCaptureIdentity
+	oldStart, oldStartMode, oldPoll, oldRefresh := repairStartNativeOAuth, repairStartNativeOAuthMode, repairPollNativeOAuth, repairRefreshQuota
+	oldNativeRequest := nativeRequestFn
+	t.Cleanup(func() {
+		repairListAccounts, repairSafeQuarantine, repairBindCallbackForwarder = oldList, oldQuarantine, oldBind
+		repairCaptureIdentity = oldCapture
+		repairStartNativeOAuth, repairStartNativeOAuthMode, repairPollNativeOAuth, repairRefreshQuota = oldStart, oldStartMode, oldPoll, oldRefresh
+		nativeRequestFn = oldNativeRequest
+	})
+
+	quarantineCalls := 0
+	repairCaptureIdentity = func(a account) account {
+		if a.Key == second.Key {
+			a.AccountID = second.AccountID
+		}
+		return a
+	}
+	oauthStarts := 0
+	repairListAccounts = func() ([]account, error) {
+		if oauthStarts < 2 {
+			return []account{first, second}, nil
+		}
+		return []account{first, secondReplacement}, nil
+	}
+	repairSafeQuarantine = func(string, string, string) (string, error) {
+		quarantineCalls++
+		return "unexpected-quarantine", nil
+	}
+	repairBindCallbackForwarder = func() (*callbackForwarder, error) { return &callbackForwarder{}, nil }
+	startOAuth := func(context.Context, string, string, bool) (nativeOAuthStart, error) {
+		oauthStarts++
+		return nativeOAuthStart{URL: "https://login.example.test/authorize", State: "state-" + strconv.Itoa(oauthStarts)}, nil
+	}
+	repairStartNativeOAuthMode = startOAuth
+	repairStartNativeOAuth = func(ctx context.Context, authHeader, email string) (nativeOAuthStart, error) {
+		return startOAuth(ctx, authHeader, email, false)
+	}
+	repairPollNativeOAuth = func(_ context.Context, _ string, state string) (string, error) {
+		if state == "state-1" {
+			return "", errors.New("oauth_poll_failed")
+		}
+		return "success", nil
+	}
+	repairRefreshQuota = func(a account) account {
+		if a.AccessTokenValue != "" {
+			a.QuotaStatusCode = http.StatusOK
+			a.Quota = quotaSnapshot{Windows: []quotaWindow{{Presence: windowPresent}}}
+		} else {
+			a.QuotaStatusCode = http.StatusUnauthorized
+		}
+		return a
+	}
+	nativeRequestFn = func(_ context.Context, _ string, _ string, _ string, _ url.Values) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusNoContent, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(""))}, nil
+	}
+
+	runReviveQueue(&reviveRuntime{jobID: jobID, queued: []account{first, second}, browserMode: reviveBrowserModeAgent})
+	job, err := readJob(jobID)
+	if err != nil || job.State != "failed" || job.Done != 1 || job.Reason != "oauth_poll_failed" {
+		t.Fatalf("transient failure did not allow later repair: job=%+v err=%v", job, err)
+	}
+	rows, err := loadRepairRows(jobID)
+	if err != nil || len(rows) != 2 || rows[0].RepairState != "failed" || rows[1].RepairState != "repaired" {
+		t.Fatalf("unexpected row states after transient continuation: rows=%+v err=%v", rows, err)
+	}
+	if rows[0].Quarantine != "" || quarantineCalls != 0 {
+		t.Fatalf("agent transient failure quarantined the row: rows=%+v calls=%d", rows, quarantineCalls)
+	}
+	// Agent mode must not activate or scan a desktop mail client.
+}
+
 func testReviveWorkspaceQueue(t *testing.T, mode string) {
 	db, _ := setupRepairRecoveryStore(t)
 	jobID := "repair-same-email-workspaces"
@@ -788,6 +1061,9 @@ func testReviveWorkspaceQueue(t *testing.T, mode string) {
 			}
 			return []account{first, second}, nil
 		case 1:
+			if mode == reviveBrowserModeAgent {
+				return []account{firstReplacement, second}, nil
+			}
 			return []account{secondReplacement}, nil
 		default:
 			return []account{secondReplacement, firstReplacement}, nil
@@ -1156,8 +1432,8 @@ func TestReviveQueueStopsPromptlyOnProviderAuthError(t *testing.T) {
 		t.Fatalf("provider authentication failure was not terminal and sanitized: job=%+v err=%v", job, err)
 	}
 	rows, err := loadRepairRows(jobID)
-	if err != nil || len(rows) != 1 || rows[0].RepairState != "failed" || rows[0].Quarantine != "quarantine-marker" {
-		t.Fatalf("provider authentication failure lost resumable quarantine state: rows=%+v err=%v", rows, err)
+	if err != nil || len(rows) != 1 || rows[0].RepairState != "skipped" || rows[0].Quarantine != "quarantine-marker" {
+		t.Fatalf("provider authentication failure was not auto-skipped with quarantine preserved: rows=%+v err=%v", rows, err)
 	}
 	if cancelCalls != 1 {
 		t.Fatalf("provider authentication failure cancelled native OAuth %d times", cancelCalls)
@@ -1191,17 +1467,20 @@ func TestAgentPollAndCodeShareAttempt(t *testing.T) {
 	reviveRuntimeState.Lock()
 	reviveRuntimeState.jobs[id] = r
 	reviveRuntimeState.Unlock()
-	old := repairDetectThunderbirdCode
+	old := repairDetectCode
 	calls := 0
-	repairDetectThunderbirdCode = func(email string, cutoff time.Time) (thunderbirdCode, error) {
+	repairDetectCode = func(email string, cutoff time.Time) (thunderbirdCode, error) {
 		calls++
 		if email != "fixture@example.test" || !cutoff.Equal(requested) {
 			t.Fatal("wrong mailbox attempt")
 		}
-		return thunderbirdCode{Code: "123456", ReceivedAt: requested}, nil
+		// IMAP Date headers have second-level precision. Phoenix must accept the
+		// same bounded tolerance as Agent Autofill when the request starts just
+		// after the message's recorded second.
+		return thunderbirdCode{Code: "123456", ReceivedAt: requested.Add(-time.Second), Recipient: email}, nil
 	}
 	t.Cleanup(func() {
-		repairDetectThunderbirdCode = old
+		repairDetectCode = old
 		reviveRuntimeState.Lock()
 		delete(reviveRuntimeState.jobs, id)
 		reviveRuntimeState.Unlock()
@@ -1213,17 +1492,368 @@ func TestAgentPollAndCodeShareAttempt(t *testing.T) {
 	if poll["automatic"] != false || poll["attempt"] != formatReviveAttempt(requested) {
 		t.Fatal("missing agent attempt")
 	}
-	if err := json.Unmarshal(reviveCode(id, poll["attempt"].(string)).Body, &code); err != nil {
+	attempt := poll["attempt"].(string)
+	if err := json.Unmarshal(reviveCode(id, attempt).Body, &code); err != nil {
 		t.Fatal(err)
 	}
-	if code["attempt"] != poll["attempt"] || code["code"] != "123456" {
+	if code["attempt"] != attempt || code["code"] != "123456" {
 		t.Fatal("code attempt mismatch")
+	}
+	if err := json.Unmarshal(reviveCode(id, attempt).Body, &code); err != nil {
+		t.Fatal(err)
+	}
+	if code["attempt"] != attempt || code["code"] != "123456" || calls != 1 {
+		t.Fatalf("positive code was not cached: code=%v calls=%d", code, calls)
+	}
+	missingAttempt := routeManagement(managementRequest{Method: http.MethodPost, Path: "/v0/management/plugins/cpa-phoenix/revive/code", Query: map[string][]string{"id": {id}}})
+	if missingAttempt.StatusCode != http.StatusBadRequest || !strings.Contains(string(missingAttempt.Body), `"attempt_required"`) {
+		t.Fatalf("missing attempt status=%d body=%s", missingAttempt.StatusCode, missingAttempt.Body)
+	}
+	routed := routeManagement(managementRequest{Method: http.MethodPost, Path: "/v0/management/plugins/cpa-phoenix/revive/code", Query: map[string][]string{"id": {id}, "attempt": {attempt}}})
+	if routed.StatusCode != http.StatusOK || !strings.Contains(string(routed.Body), `"code":"123456"`) || calls != 1 {
+		t.Fatalf("route did not forward the current attempt or reuse cache: status=%d body=%s calls=%d", routed.StatusCode, routed.Body, calls)
 	}
 	if err := json.Unmarshal(reviveCode(id, "previous").Body, &code); err != nil {
 		t.Fatal(err)
 	}
 	if code["error"] != "stale_attempt" || calls != 1 {
 		t.Fatal("stale attempt read mailbox")
+	}
+}
+
+func TestReviveCodeNegativeResultIsCachedUntilExpiry(t *testing.T) {
+	db, _ := setupRepairRecoveryStore(t)
+	id := "agent-negative-cache"
+	seedRepairRecoveryState(t, db, id, "running", "awaiting_user", "")
+	requested := time.Now().Add(-time.Second)
+	runtime := &reviveRuntime{jobID: id, browserMode: reviveBrowserModeAgent, verificationRequestedAt: requested, queued: []account{{Email: "fixture@example.test"}}}
+	reviveRuntimeState.Lock()
+	reviveRuntimeState.jobs[id] = runtime
+	reviveRuntimeState.Unlock()
+	old := repairDetectCode
+	calls := 0
+	repairDetectCode = func(string, time.Time) (thunderbirdCode, error) {
+		calls++
+		return thunderbirdCode{}, errAgentAutofillNoCode
+	}
+	t.Cleanup(func() {
+		repairDetectCode = old
+		reviveRuntimeState.Lock()
+		delete(reviveRuntimeState.jobs, id)
+		reviveRuntimeState.Unlock()
+	})
+	attempt := formatReviveAttempt(requested)
+	first := reviveCode(id, attempt)
+	second := reviveCode(id, attempt)
+	if first.StatusCode != http.StatusOK || second.StatusCode != http.StatusOK || calls != 1 || !strings.Contains(string(second.Body), `"verification_code_not_found"`) {
+		t.Fatalf("negative result was not cached: first=%s second=%s calls=%d", first.Body, second.Body, calls)
+	}
+	runtime.mu.Lock()
+	runtime.codeProbe.checkedAt = time.Now().Add(-reviveCodeNegativeTTL - time.Millisecond)
+	runtime.mu.Unlock()
+	third := reviveCode(id, attempt)
+	if third.StatusCode != http.StatusOK || calls != 2 {
+		t.Fatalf("expired negative result did not refresh: body=%s calls=%d", third.Body, calls)
+	}
+}
+
+func TestReviveSkipRejectsStaleAttemptAndAutomaticMode(t *testing.T) {
+	db, _ := setupRepairRecoveryStore(t)
+	jobID := "skip-contract"
+	seedRepairRecoveryState(t, db, jobID, "awaiting_user", "awaiting_user", "opaque-quarantine")
+	requested := time.Now().UTC()
+	runtime := &reviveRuntime{
+		jobID:                   jobID,
+		browserMode:             reviveBrowserModeAgent,
+		current:                 0,
+		oauthURL:                "https://login.example.test/authorize",
+		oauthState:              "native-state",
+		verificationRequestedAt: requested,
+		queued:                  []account{{AccountID: "account-id", Email: "opaque-seat", RepairState: "awaiting_user", Quarantine: "opaque-quarantine"}},
+	}
+	reviveRuntimeState.Lock()
+	reviveRuntimeState.jobs[jobID] = runtime
+	reviveRuntimeState.Unlock()
+	t.Cleanup(func() {
+		reviveRuntimeState.Lock()
+		delete(reviveRuntimeState.jobs, jobID)
+		reviveRuntimeState.Unlock()
+	})
+
+	oldNativeRequest := nativeRequestFn
+	cancelCalls := 0
+	nativeRequestFn = func(_ context.Context, method, path, _ string, query url.Values) (*http.Response, error) {
+		if method == http.MethodDelete && path == "/v0/management/oauth-session" && query.Get("state") == "native-state" {
+			cancelCalls++
+		}
+		return &http.Response{StatusCode: http.StatusNoContent, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(""))}, nil
+	}
+	t.Cleanup(func() { nativeRequestFn = oldNativeRequest })
+
+	staleBody, _ := json.Marshal(map[string]string{"job_id": jobID, "attempt": "old-attempt", "reason": reviveSkipProviderAuthReason})
+	response := routeManagement(managementRequest{Method: http.MethodPost, Path: "/v0/management/plugins/cpa-phoenix/revive/skip", Body: staleBody})
+	if response.StatusCode != http.StatusConflict || !strings.Contains(string(response.Body), `"stale_attempt"`) {
+		t.Fatalf("stale skip status=%d body=%s", response.StatusCode, response.Body)
+	}
+	rows, err := loadRepairRows(jobID)
+	if err != nil || len(rows) != 1 || rows[0].RepairState != "awaiting_user" || rows[0].Quarantine != "opaque-quarantine" {
+		t.Fatalf("stale skip changed durable row: rows=%+v err=%v", rows, err)
+	}
+	if cancelCalls != 0 {
+		t.Fatalf("stale skip cancelled native OAuth %d times", cancelCalls)
+	}
+
+	runtime.mu.Lock()
+	runtime.browserMode = reviveBrowserModeAutomatic
+	attempt := formatReviveAttempt(runtime.verificationRequestedAt)
+	runtime.mu.Unlock()
+	validBody, _ := json.Marshal(map[string]string{"job_id": jobID, "attempt": attempt, "reason": reviveSkipProviderAuthReason})
+	response = routeManagement(managementRequest{Method: http.MethodPost, Path: "/v0/management/plugins/cpa-phoenix/revive/skip", Body: validBody})
+	if response.StatusCode != http.StatusConflict || !strings.Contains(string(response.Body), `"agent_mode_required"`) {
+		t.Fatalf("automatic-mode skip status=%d body=%s", response.StatusCode, response.Body)
+	}
+	rows, err = loadRepairRows(jobID)
+	if err != nil || len(rows) != 1 || rows[0].RepairState != "awaiting_user" || rows[0].Quarantine != "opaque-quarantine" {
+		t.Fatalf("automatic-mode skip changed durable row: rows=%+v err=%v", rows, err)
+	}
+}
+
+func TestReviveSkipAdvancesQueueAndPreservesQuarantine(t *testing.T) {
+	db, _ := setupRepairRecoveryStore(t)
+	jobID := "skip-advance"
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO jobs(id,kind,state,created_at,updated_at,total,done) VALUES(?,?,?,?,?,?,?)`, jobID, "revive", "running", now, now, 2, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO repair_rows(job_id,ordinal,account_key,email,account_id,state,quarantine) VALUES(?,?,?,?,?,?,?)`, jobID, 1, "seat-one", "one@example.test", "account-one", "quarantined", "quarantine-one"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO repair_rows(job_id,ordinal,account_key,email,account_id,state,quarantine) VALUES(?,?,?,?,?,?,?)`, jobID, 2, "seat-two", "two@example.test", "account-two", "quarantined", "quarantine-two"); err != nil {
+		t.Fatal(err)
+	}
+	expectedOne := account{Key: "seat-one", AccountID: "account-one", Email: "one@example.test", Physical: true, Status: "authentication_error", RepairState: "quarantined", Quarantine: "quarantine-one"}
+	expectedTwo := account{Key: "seat-two", AccountID: "account-two", Email: "two@example.test", Physical: true, Status: "authentication_error", RepairState: "quarantined", Quarantine: "quarantine-two"}
+	installRepairTestDeps(t,
+		func() ([]account, error) { return []account{expectedOne, expectedTwo}, nil },
+		func(string, string, string) (string, error) { return "unexpected-quarantine", nil },
+		func(context.Context, string, string) (nativeOAuthStart, error) {
+			t.Fatalf("skipping the first row must advance to the next row without starting another OAuth")
+			return nativeOAuthStart{}, nil
+		},
+	)
+	firstPoll := make(chan struct{})
+	var pollOnce sync.Once
+	secondPoll := 0
+	repairPollNativeOAuth = func(ctx context.Context, _ string, state string) (string, error) {
+		if state != "native-state" {
+			secondPoll++
+			return "", errors.New("unexpected_second_oauth")
+		}
+		pollOnce.Do(func() { close(firstPoll) })
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	repairRefreshQuota = func(a account) account {
+		if a.AccountID == expectedTwo.AccountID {
+			a.QuotaStatusCode = http.StatusOK
+		}
+		return a
+	}
+	repairStartNativeOAuth = func(context.Context, string, string) (nativeOAuthStart, error) {
+		return nativeOAuthStart{URL: "https://login.example.test/authorize", State: "native-state"}, nil
+	}
+	oldNativeRequest := nativeRequestFn
+	cancelCalls := 0
+	nativeRequestFn = func(_ context.Context, method, path, _ string, query url.Values) (*http.Response, error) {
+		if method == http.MethodDelete && path == "/v0/management/oauth-session" && query.Get("state") == "native-state" {
+			cancelCalls++
+		}
+		return &http.Response{StatusCode: http.StatusNoContent, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(""))}, nil
+	}
+	t.Cleanup(func() { nativeRequestFn = oldNativeRequest })
+
+	runtime := &reviveRuntime{jobID: jobID, browserMode: reviveBrowserModeAgent, queued: []account{expectedOne, expectedTwo}}
+	reviveRuntimeState.Lock()
+	reviveRuntimeState.jobs[jobID] = runtime
+	reviveRuntimeState.Unlock()
+	go runReviveQueue(runtime)
+	select {
+	case <-firstPoll:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first OAuth attempt did not reach native poll")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	var attempt string
+	for time.Now().Before(deadline) {
+		runtime.mu.Lock()
+		attempt = formatReviveAttempt(runtime.verificationRequestedAt)
+		activeState := runtime.oauthState
+		runtime.mu.Unlock()
+		if activeState == "native-state" && attempt != "" {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if attempt == "" {
+		t.Fatal("first OAuth attempt did not publish an attempt token")
+	}
+	body, _ := json.Marshal(map[string]string{"job_id": jobID, "attempt": attempt, "reason": reviveSkipProviderAuthReason})
+	response := routeManagement(managementRequest{Method: http.MethodPost, Path: "/v0/management/plugins/cpa-phoenix/revive/skip", Body: body})
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(response.Body), `"skipped"`) {
+		t.Fatalf("skip status=%d body=%s", response.StatusCode, response.Body)
+	}
+	job := waitForRepairJobState(t, jobID, "failed")
+	if job.Reason != reviveSkipProviderAuthReason || job.Done != 1 {
+		t.Fatalf("skip queue terminal state=%+v", job)
+	}
+	rows, err := loadRepairRows(jobID)
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("load skipped queue rows=%+v err=%v", rows, err)
+	}
+	if rows[0].RepairState != "skipped" || rows[0].Quarantine != "quarantine-one" || rows[1].RepairState != "repaired" || rows[1].Quarantine != "quarantine-two" {
+		t.Fatalf("skip did not preserve/advance exact rows: rows=%+v", rows)
+	}
+	if cancelCalls != 1 || secondPoll != 0 {
+		t.Fatalf("skip cancelled wrong native attempt or retried OAuth: cancels=%d secondPoll=%d", cancelCalls, secondPoll)
+	}
+	queue := incompleteRepairQueue()
+	if len(queue) != 1 || queue[0]["state"] != "skipped" || queue[0]["quarantined"] != true {
+		t.Fatalf("skipped queue projection lost unresolved quarantine: %v", queue)
+	}
+}
+
+func TestReviveSkipsPreservedQuarantineWhenInventoryIsEmpty(t *testing.T) {
+	db, _ := setupRepairRecoveryStore(t)
+	jobID := "skip-retry-empty-inventory"
+	seedRepairRecoveryState(t, db, jobID, "failed", "skipped", "quarantine-marker")
+	expected := account{Key: "repair-seat", AccountID: "account-id", Email: "opaque-seat", Physical: true, Status: "authentication_error", RepairState: "skipped", Quarantine: "quarantine-marker"}
+	inventoryCalls := 0
+	oauthStarts := 0
+	installRepairTestDeps(t,
+		func() ([]account, error) {
+			inventoryCalls++
+			if inventoryCalls == 1 {
+				// The seat disappeared from the live inventory after it was
+				// quarantined. The preserved row remains the retry authority.
+				return nil, nil
+			}
+			return []account{expected}, nil
+		},
+		func(string, string, string) (string, error) {
+			t.Fatalf("retrying a quarantined row must not quarantine again")
+			return "", nil
+		},
+		func(context.Context, string, string) (nativeOAuthStart, error) {
+			oauthStarts++
+			return nativeOAuthStart{URL: "https://login.example.test/authorize", State: "retry-state"}, nil
+		},
+	)
+	repairRefreshQuota = func(a account) account { return a }
+	repairPollNativeOAuth = func(context.Context, string, string) (string, error) {
+		return "", errors.New("retry_poll_failed")
+	}
+	oldNativeRequest := nativeRequestFn
+	nativeRequestFn = func(_ context.Context, method, path, _ string, query url.Values) (*http.Response, error) {
+		if method != http.MethodDelete || path != "/v0/management/oauth-session" || query.Get("state") != "retry-state" {
+			t.Fatalf("unexpected native request during skipped-row retry: method=%q path=%q query=%v", method, path, query)
+		}
+		return &http.Response{StatusCode: http.StatusNoContent, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(""))}, nil
+	}
+	t.Cleanup(func() { nativeRequestFn = oldNativeRequest })
+
+	response, err := beginRevive(nil, reviveBrowserModeAgent)
+	if !errors.Is(err, errNoActionableAccounts) || response.JobID != "" || oauthStarts != 0 {
+		t.Fatalf("ordinary Revive retried a preserved skipped row: response=%+v err=%v oauthStarts=%d", response, err, oauthStarts)
+	}
+	rows, err := loadRepairRows(jobID)
+	if err != nil || len(rows) != 1 || rows[0].RepairState != "skipped" || rows[0].Quarantine != "quarantine-marker" {
+		t.Fatalf("ordinary Revive changed skipped row quarantine/state: rows=%+v err=%v", rows, err)
+	}
+}
+
+func TestExplicitReviveStartsFreshDisjointQueueWithoutSupersedingSkippedHistory(t *testing.T) {
+	db, _ := setupRepairRecoveryStore(t)
+	oldID := "skip-history-disjoint"
+	seedRepairRecoveryState(t, db, oldID, "failed", "skipped", "quarantine-old")
+	current := account{Key: "current-seat", AccountID: "current-account", Email: "current@example.test", Physical: true, Status: "authentication_error"}
+	installRepairTestDeps(t,
+		func() ([]account, error) { return []account{current}, nil },
+		func(string, string, string) (string, error) {
+			t.Fatalf("disjoint fresh queue must not touch the historical quarantine")
+			return "", nil
+		},
+		func(context.Context, string, string) (nativeOAuthStart, error) {
+			t.Fatalf("current row has no exact auth path and should fail before OAuth")
+			return nativeOAuthStart{}, nil
+		},
+	)
+	response, err := beginRevive(nil, reviveBrowserModeAgent)
+	if err != nil || response.JobID == "" || response.JobID == oldID {
+		t.Fatalf("disjoint actionable inventory did not start a fresh queue: response=%+v err=%v", response, err)
+	}
+	waitForRepairJobState(t, response.JobID, "failed")
+	oldJob, err := readJob(oldID)
+	if err != nil || oldJob.State != "failed" {
+		t.Fatalf("historical skipped job changed state: job=%+v err=%v", oldJob, err)
+	}
+	oldRows, err := loadRepairRows(oldID)
+	if err != nil || len(oldRows) != 1 || oldRows[0].RepairState != "skipped" || oldRows[0].Quarantine != "quarantine-old" {
+		t.Fatalf("historical skipped quarantine was not preserved: rows=%+v err=%v", oldRows, err)
+	}
+}
+
+func TestReviveDoesNotReopenOlderSkippedHistory(t *testing.T) {
+	db, _ := setupRepairRecoveryStore(t)
+	oldID := "older-skipped-history"
+	seedRepairRecoveryState(t, db, oldID, "failed", "skipped", "quarantine-old")
+	newID := "newer-completed-queue"
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO jobs(id,kind,state,created_at,updated_at,total,done) VALUES(?,?,?,?,?,?,?)`, newID, "revive", "completed", now+1, now+1, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO repair_rows(job_id,ordinal,account_key,email,account_id,state) VALUES(?,?,?,?,?,'repaired')`, newID, 1, "new-seat", "new@example.test", "new-account"); err != nil {
+		t.Fatal(err)
+	}
+	expected := account{Key: "repair-seat", AccountID: "account-id", Email: "opaque-seat", Physical: true, Status: "authentication_error", RepairState: "skipped", Quarantine: "quarantine-old"}
+	inventoryCalls := 0
+	oauthStarts := 0
+	installRepairTestDeps(t,
+		func() ([]account, error) {
+			inventoryCalls++
+			if inventoryCalls == 1 {
+				return nil, nil // no current actionable rows; only historical skip remains
+			}
+			return []account{expected}, nil
+		},
+		func(string, string, string) (string, error) {
+			t.Fatalf("historical skipped retry must not quarantine again")
+			return "", nil
+		},
+		func(context.Context, string, string) (nativeOAuthStart, error) {
+			oauthStarts++
+			return nativeOAuthStart{URL: "https://login.example.test/authorize", State: "historical-retry-state"}, nil
+		},
+	)
+	repairRefreshQuota = func(a account) account { return a }
+	repairPollNativeOAuth = func(context.Context, string, string) (string, error) {
+		return "", errors.New("historical_retry_poll_failed")
+	}
+	oldNativeRequest := nativeRequestFn
+	nativeRequestFn = func(_ context.Context, method, path, _ string, query url.Values) (*http.Response, error) {
+		if method != http.MethodDelete || path != "/v0/management/oauth-session" || query.Get("state") != "historical-retry-state" {
+			t.Fatalf("unexpected native request during historical retry: method=%q path=%q query=%v", method, path, query)
+		}
+		return &http.Response{StatusCode: http.StatusNoContent, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(""))}, nil
+	}
+	t.Cleanup(func() { nativeRequestFn = oldNativeRequest })
+
+	response, err := beginRevive(nil, reviveBrowserModeAgent)
+	if !errors.Is(err, errNoActionableAccounts) || response.JobID != "" || oauthStarts != 0 {
+		t.Fatalf("ordinary Revive reopened older skipped history: response=%+v err=%v oauthStarts=%d", response, err, oauthStarts)
+	}
+	rows, err := loadRepairRows(oldID)
+	if err != nil || len(rows) != 1 || rows[0].RepairState != "skipped" || rows[0].Quarantine != "quarantine-old" {
+		t.Fatalf("ordinary Revive changed older skipped quarantine/state: rows=%+v err=%v", rows, err)
 	}
 }
 
@@ -1280,6 +1910,19 @@ func TestReviveFailurePreservesQuarantineAcrossResume(t *testing.T) {
 	}
 	if _, err := os.Stat(predecessor); err != nil {
 		t.Fatalf("already-quarantined resume touched predecessor path: %v", err)
+	}
+}
+
+func TestReviveAutoSkipStateOnlySkipsProviderAndTimeout(t *testing.T) {
+	for _, state := range []string{reviveSkipProviderAuthReason, "oauth_timeout"} {
+		if !reviveAutoSkipState(state) {
+			t.Fatalf("%q must auto-skip so one blocked attempt cannot stop later rows", state)
+		}
+	}
+	for _, state := range []string{"oauth_poll_failed", "replacement_not_queued", "manual_captcha_required"} {
+		if reviveAutoSkipState(state) {
+			t.Fatalf("%q must remain resumable or require intervention", state)
+		}
 	}
 }
 
