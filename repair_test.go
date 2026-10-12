@@ -743,6 +743,92 @@ func TestAgentTimeoutWithoutQuarantineRemainsRecoverable(t *testing.T) {
 	}
 }
 
+func TestResetReviveQueueDismissesOnlyTerminalRecoverableJobs(t *testing.T) {
+	db, _ := setupRepairRecoveryStore(t)
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO jobs(id,kind,state,created_at,updated_at,total,done) VALUES(?,?,?,?,?,?,?)`, "resettable", "revive", "failed", now, now, 2, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO repair_rows(job_id,ordinal,email,account_id,account_key,state,reason) VALUES(?,?,?,?,?,?,?)`, "resettable", 1, "done@example.test", "done-account", "done-key", "repaired", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO repair_rows(job_id,ordinal,email,account_id,account_key,state,reason) VALUES(?,?,?,?,?,?,?)`, "resettable", 2, "skipped@example.test", "skipped-account", "skipped-key", "skipped", "oauth_timeout"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO jobs(id,kind,state,created_at,updated_at,total,done) VALUES(?,?,?,?,?,?,?)`, "blocked", "revive", "failed", now+1, now+1, 2, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO repair_rows(job_id,ordinal,email,account_id,account_key,state,reason) VALUES(?,?,?,?,?,?,?)`, "blocked", 1, "blocked@example.test", "blocked-account", "blocked-key", "skipped", "provider_auth_error"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO repair_rows(job_id,ordinal,email,account_id,account_key,state,reason) VALUES(?,?,?,?,?,?,'provider_auth_error')`, "blocked", 2, "blocked-two@example.test", "blocked-account-2", "blocked-key-2", "skipped"); err != nil {
+		t.Fatal(err)
+	}
+	jobs, rows, err := resetReviveQueue()
+	if err != nil || jobs != 1 || rows != 1 {
+		t.Fatalf("unexpected reset result: jobs=%d rows=%d err=%v", jobs, rows, err)
+	}
+	job, err := readJob("resettable")
+	if err != nil || job.State != "superseded" || job.Reason != "owner_reset" {
+		t.Fatalf("resettable job was not dismissed safely: job=%+v err=%v", job, err)
+	}
+	job, err = readJob("blocked")
+	if err != nil || job.State != "failed" {
+		t.Fatalf("job with a queued row was reset: job=%+v err=%v", job, err)
+	}
+	queue := incompleteRepairQueue()
+	if len(queue) != 2 || queue[0]["email"] != "blocked@example.test" || queue[1]["email"] != "blocked-two@example.test" {
+		t.Fatalf("reset hid the wrong rows: queue=%v", queue)
+	}
+	var skipped int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM repair_rows WHERE job_id='resettable' AND state='skipped'`).Scan(&skipped); err != nil || skipped != 1 {
+		t.Fatalf("reset deleted the audit row: skipped=%d err=%v", skipped, err)
+	}
+}
+
+func TestResetReviveQueueRefusesActiveJobs(t *testing.T) {
+	setupRepairRecoveryStore(t)
+	id, err := globalJobs.start("revive", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer globalJobs.stopIf(id)
+	if _, _, err := resetReviveQueue(); !errors.Is(err, errIgniteJobActive) {
+		t.Fatalf("reset should not interrupt active repair: %v", err)
+	}
+}
+
+func TestAutoDismissRecoverableSkippedJobLeavesProviderAuthQueueVisible(t *testing.T) {
+	db, _ := setupRepairRecoveryStore(t)
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO jobs(id,kind,state,created_at,updated_at,total,done) VALUES(?,?,?,?,?,?,?)`, "auto-reset", "revive", "running", now, now, 2, 1); err != nil {
+		t.Fatal(err)
+	}
+	for ordinal, reason := range map[int]string{1: "oauth_timeout", 2: "workspace_missing"} {
+		if _, err := db.Exec(`INSERT INTO repair_rows(job_id,ordinal,email,account_id,account_key,state,reason) VALUES(?,?,?,?,?,?,?)`, "auto-reset", ordinal, fmt.Sprintf("seat-%d@example.test", ordinal), fmt.Sprintf("account-%d", ordinal), fmt.Sprintf("key-%d", ordinal), "skipped", reason); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !autoDismissRecoverableSkippedJob("auto-reset") {
+		t.Fatal("recoverable skipped rows should be auto-dismissable")
+	}
+	if _, err := db.Exec(`UPDATE jobs SET state='superseded',reason='auto_reset_recoverable_skips' WHERE id='auto-reset'`); err != nil {
+		t.Fatal(err)
+	}
+	if queue := incompleteRepairQueue(); len(queue) != 0 {
+		t.Fatalf("auto-dismissed recoverable queue remained visible: %v", queue)
+	}
+	if _, err := db.Exec(`INSERT INTO jobs(id,kind,state,created_at,updated_at,total,done) VALUES(?,?,?,?,?,?,?)`, "provider-auth", "revive", "running", now+1, now+1, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO repair_rows(job_id,ordinal,email,account_id,account_key,state,reason) VALUES(?,?,?,?,?,?,?)`, "provider-auth", 1, "provider@example.test", "provider-account", "provider-key", "skipped", "provider_auth_error"); err != nil {
+		t.Fatal(err)
+	}
+	if autoDismissRecoverableSkippedJob("provider-auth") {
+		t.Fatal("provider-auth skips must remain unresolved")
+	}
+}
+
 func TestQuarantinedResumeWithMissingPrivateIdentityStopsBeforeOAuth(t *testing.T) {
 	db, _ := setupRepairRecoveryStore(t)
 	jobID := "repair-missing-resume-identity"

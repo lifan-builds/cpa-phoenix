@@ -173,13 +173,21 @@ records repaired, skipped, and failed accounts.
 The terminal status view can show unresolved rows from more than one historical
 repair job. Phoenix keeps the newest outcome for each exact private workspace;
 an unrelated later repair cannot hide another missing seat. Retry one durable
-job's timed-out seats at a time, then refresh the inventory for the next batch.
+job's paused or timed-out seats at a time, then refresh the inventory for the
+next batch. If a terminal queue contains only recoverable timeout or
+workspace-mismatch rows and you no longer want to retry them, use
+`phoenixctl reset`. Phoenix marks that history
+superseded without deleting its audit rows; the next repair scan can queue the
+same workspaces again if they are still invalid. Provider-auth or deactivation
+rows stay visible for owner review.
 
 For a dashboard-free workflow, use the terminal client:
 
 ```bash
 ./phoenixctl status
 ./phoenixctl repair
+# Optional: clear recoverable timeout/workspace-mismatch history
+./phoenixctl reset
 ```
 
 The client prompts for the management key without echoing it. For automation,

@@ -25,6 +25,7 @@ Commands:
   otp             Show Agent Autofill connector readiness
   repair          Start or resume Agent-mode repair and follow the queue
   recover SEAT...  Retry explicitly paused/timed-out seat labels
+  reset           Dismiss recoverable skipped repair history (keeps audit rows)
   code JOB ATTEMPT
                   Read a fresh code for an explicitly named active attempt
   skip JOB ATTEMPT
@@ -242,6 +243,12 @@ cancel_command() {
   printf '%s\n' "$API_BODY"
 }
 
+reset_command() {
+  require_key
+  api POST /revive/reset '{"acknowledge":"CPA_PHOENIX_ONE_CLICK"}'
+  printf '%s\n' "$API_BODY"
+}
+
 need_command curl
 need_command python3
 
@@ -256,6 +263,7 @@ while [[ $# -gt 0 ]]; do
     otp) command_name=otp; shift; break ;;
     repair|revive) command_name=repair; shift; break ;;
     recover) command_name=recover; shift; break ;;
+    reset) command_name=reset; shift; break ;;
     code) command_name=code; shift; break ;;
     skip) command_name=skip; shift; break ;;
     pause) command_name=pause; shift; break ;;
@@ -269,6 +277,7 @@ case "$command_name" in
   otp) [[ $# -eq 0 ]] || die 'otp takes no arguments'; otp_command ;;
   repair) [[ $# -eq 0 ]] || die 'repair takes no arguments'; repair_command ;;
   recover) recover_command "$@" ;;
+  reset) [[ $# -eq 0 ]] || die 'reset takes no arguments'; reset_command ;;
   code) [[ $# -eq 2 ]] || die 'code requires JOB and ATTEMPT'; code_command "$1" "$2" ;;
   skip) [[ $# -eq 2 ]] || die 'skip requires JOB and ATTEMPT'; skip_command "$1" "$2" ;;
   pause) [[ $# -eq 2 ]] || die 'pause requires JOB and ATTEMPT'; pause_command "$1" "$2" ;;

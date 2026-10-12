@@ -52,3 +52,25 @@ func TestOTPStatusReportsInstalledConnectorWithoutRecipientMap(t *testing.T) {
 		t.Fatalf("unexpected installed connector status: %#v", status)
 	}
 }
+
+func TestResetReviveRouteRequiresAcknowledgementAndReturnsCounts(t *testing.T) {
+	if response := routeManagement(managementRequest{Method: http.MethodPost, Path: "/v0/management/plugins/cpa-phoenix/revive/reset", Body: []byte(`{}`)}); response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("reset without acknowledgement status=%d body=%s", response.StatusCode, response.Body)
+	}
+	db, _ := setupRepairRecoveryStore(t)
+	seedRepairRecoveryState(t, db, "route-reset", "failed", "skipped", "")
+	if _, err := db.Exec(`UPDATE repair_rows SET reason='oauth_timeout' WHERE job_id='route-reset'`); err != nil {
+		t.Fatal(err)
+	}
+	response := routeManagement(managementRequest{Method: http.MethodPost, Path: "/v0/management/plugins/cpa-phoenix/revive/reset", Body: []byte(`{"acknowledge":"CPA_PHOENIX_ONE_CLICK"}`)})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("reset route status=%d body=%s", response.StatusCode, response.Body)
+	}
+	var result map[string]any
+	if err := json.Unmarshal(response.Body, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result["state"] != "reset" || result["jobs"] != float64(1) || result["rows"] != float64(1) {
+		t.Fatalf("unexpected reset route result: %#v", result)
+	}
+}

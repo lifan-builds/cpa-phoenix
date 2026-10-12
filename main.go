@@ -229,7 +229,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		startQuotaFloorScheduler()
 		return okJSON(pluginRegisterResponse{SchemaVersion: 1, Metadata: pluginMetadata{Name: "CPA Phoenix", Version: pluginVersion, Author: "lifan-builds", GitHubRepository: "https://github.com/lifan-builds/cpa-phoenix"}, Capabilities: phoenixCapabilities()}), nil
 	case "management.register":
-		return okJSON(managementRegistrationResponse{Routes: []managementRoute{{"POST", "/plugins/cpa-phoenix/scan", "Refresh sanitized account counts."}, {"GET", "/plugins/cpa-phoenix/state", "Read sanitized job state."}, {"GET", "/plugins/cpa-phoenix/otp/status", "Read the local Agent Autofill connector status."}, {"POST", "/plugins/cpa-phoenix/ignite", "Ignite all fresh accounts once."}, {"GET", "/plugins/cpa-phoenix/ignite/schedule", "Read the daily Ignite schedule."}, {"POST", "/plugins/cpa-phoenix/ignite/schedule", "Configure the daily Ignite schedule."}, {"GET", "/plugins/cpa-phoenix/quota-floor", "Read the Codex quota-floor controller."}, {"POST", "/plugins/cpa-phoenix/quota-floor", "Configure the Codex quota-floor controller."}, {"POST", "/plugins/cpa-phoenix/revive", "Revive all invalid accounts sequentially."}, {"POST", "/plugins/cpa-phoenix/revive/recover", "Retry explicitly selected paused or timed-out repair rows in regular Chrome."}, {"POST", "/plugins/cpa-phoenix/revive/poll", "Advance the guided repair."}, {"POST", "/plugins/cpa-phoenix/revive/code", "Read a fresh verification code from Agent Autofill."}, {"POST", "/plugins/cpa-phoenix/revive/skip", "Pause or skip the current agent OAuth attempt and continue the queue."}, {"POST", "/plugins/cpa-phoenix/revive/cancel", "Cancel the guided repair."}}, Resources: []resourceRoute{{"/dashboard", "Phoenix", "Fresh-account activation, quota protection, and invalid-auth repair."}}}), nil
+		return okJSON(managementRegistrationResponse{Routes: []managementRoute{{"POST", "/plugins/cpa-phoenix/scan", "Refresh sanitized account counts."}, {"GET", "/plugins/cpa-phoenix/state", "Read sanitized job state."}, {"GET", "/plugins/cpa-phoenix/otp/status", "Read the local Agent Autofill connector status."}, {"POST", "/plugins/cpa-phoenix/ignite", "Ignite all fresh accounts once."}, {"GET", "/plugins/cpa-phoenix/ignite/schedule", "Read the daily Ignite schedule."}, {"POST", "/plugins/cpa-phoenix/ignite/schedule", "Configure the daily Ignite schedule."}, {"GET", "/plugins/cpa-phoenix/quota-floor", "Read the Codex quota-floor controller."}, {"POST", "/plugins/cpa-phoenix/quota-floor", "Configure the Codex quota-floor controller."}, {"POST", "/plugins/cpa-phoenix/revive", "Revive all invalid accounts sequentially."}, {"POST", "/plugins/cpa-phoenix/revive/recover", "Retry explicitly selected paused or timed-out repair rows in regular Chrome."}, {"POST", "/plugins/cpa-phoenix/revive/reset", "Dismiss recoverable skipped repair history without deleting its audit rows."}, {"POST", "/plugins/cpa-phoenix/revive/poll", "Advance the guided repair."}, {"POST", "/plugins/cpa-phoenix/revive/code", "Read a fresh verification code from Agent Autofill."}, {"POST", "/plugins/cpa-phoenix/revive/skip", "Pause or skip the current agent OAuth attempt and continue the queue."}, {"POST", "/plugins/cpa-phoenix/revive/cancel", "Cancel the guided repair."}}, Resources: []resourceRoute{{"/dashboard", "Phoenix", "Fresh-account activation, quota protection, and invalid-auth repair."}}}), nil
 	case "management.handle":
 		var req managementRequest
 		if err := json.Unmarshal(request, &req); err != nil {
@@ -383,6 +383,22 @@ func routeManagement(req managementRequest) managementResponse {
 			}
 		}
 		return jsonResponse(202, result)
+	case path == "/revive/reset" && req.Method == http.MethodPost:
+		if !acknowledged(req.Body) {
+			return jsonResponse(http.StatusBadRequest, map[string]string{"error": "acknowledgement_required"})
+		}
+		jobs, rows, err := resetReviveQueue()
+		if err != nil {
+			switch {
+			case errors.Is(err, errNoResettableRepairQueue):
+				return jsonResponse(http.StatusConflict, map[string]string{"error": "no_resettable_queue"})
+			case errors.Is(err, errIgniteJobActive):
+				return jsonResponse(http.StatusConflict, map[string]string{"error": "job_active"})
+			default:
+				return jsonResponse(http.StatusServiceUnavailable, map[string]string{"error": "state_unavailable"})
+			}
+		}
+		return jsonResponse(http.StatusOK, map[string]any{"state": "reset", "jobs": jobs, "rows": rows})
 	case path == "/state" && req.Method == http.MethodGet:
 		id := firstQuery(req.Query, "id", "")
 		if id == "" {

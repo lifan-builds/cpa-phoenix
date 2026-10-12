@@ -34,6 +34,8 @@ var errNoRecoverableSkippedAccounts = errors.New("no_recoverable_skipped_account
 
 var errRecoverySeatMismatch = errors.New("recovery_seat_mismatch")
 
+var errNoResettableRepairQueue = errors.New("no_resettable_repair_queue")
+
 const (
 	reviveBrowserModeAutomatic = "automatic"
 	reviveBrowserModeAgent     = "agent"
@@ -509,6 +511,7 @@ func latestRecoverableReviveJob() (reviveJobSnapshot, bool, error) {
 	err = db.QueryRow(`SELECT j.id
 FROM jobs j
 WHERE j.kind='revive' AND j.state IN ('failed','cancelled','superseded')
+	  AND NOT (j.state='superseded' AND j.reason IN ('owner_reset','auto_reset_recoverable_skips'))
   AND EXISTS (SELECT 1 FROM repair_rows r
     WHERE r.job_id=j.id AND r.state IN ('skipped','failed')
       AND r.reason IN ('oauth_timeout','workspace_missing'))
@@ -533,6 +536,7 @@ func recoverableReviveJobForSeats(wanted map[string]struct{}) (reviveJobSnapshot
 	}
 	rows, err := db.Query(`SELECT j.id FROM jobs j
 WHERE j.kind='revive' AND j.state IN ('failed','cancelled','superseded')
+	  AND NOT (j.state='superseded' AND j.reason IN ('owner_reset','auto_reset_recoverable_skips'))
   AND EXISTS (SELECT 1 FROM repair_rows r WHERE r.job_id=j.id
     AND r.state IN ('skipped','failed') AND r.reason IN ('oauth_timeout','workspace_missing'))
 ORDER BY j.updated_at DESC,j.created_at DESC,j.rowid DESC`)
@@ -606,7 +610,7 @@ func skippedRepairIdentities() ([]account, error) {
  SELECT r.account_id,r.email,r.state,
  ROW_NUMBER() OVER (PARTITION BY TRIM(r.account_id),LOWER(TRIM(r.email)) ORDER BY j.created_at DESC,j.rowid DESC,r.ordinal DESC) AS latest
  FROM repair_rows r JOIN jobs j ON j.id=r.job_id
- WHERE j.kind='revive' AND TRIM(r.account_id)<>''
+ WHERE j.kind='revive' AND j.state<>'superseded' AND TRIM(r.account_id)<>''
 ) SELECT account_id,email FROM outcomes WHERE latest=1 AND state='skipped'`)
 	if err != nil {
 		return nil, err
@@ -887,6 +891,61 @@ func recoverTimedOutRevive(headers map[string][]string, seats []string) (reviveR
 	return response, nil
 }
 
+// resetReviveQueue dismisses only terminal jobs whose skipped rows are
+// recoverable timeout or workspace-mismatch outcomes. Their rows stay in the
+// store for audit and a later scan can create a fresh queue for the identity.
+func resetReviveQueue() (int, int, error) {
+	globalJobs.mu.Lock()
+	defer globalJobs.mu.Unlock()
+	if globalJobs.active != "" {
+		return 0, 0, errIgniteJobActive
+	}
+	db, err := openStore()
+	if err != nil {
+		return 0, 0, err
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	rollback := func() {
+		_ = tx.Rollback()
+	}
+	var active int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM jobs WHERE state IN ('running','awaiting_user')`).Scan(&active); err != nil {
+		rollback()
+		return 0, 0, err
+	}
+	if active > 0 {
+		rollback()
+		return 0, 0, errIgniteJobActive
+	}
+	var jobs, resetRows int
+	const resettable = `j.kind='revive' AND j.state IN ('failed','cancelled','completed')
+  AND r.state='skipped'
+  AND r.reason IN ('oauth_timeout','workspace_missing')
+  AND NOT EXISTS (SELECT 1 FROM repair_rows pending WHERE pending.job_id=j.id AND pending.state NOT IN ('repaired','skipped'))
+  AND NOT EXISTS (SELECT 1 FROM repair_rows blocked WHERE blocked.job_id=j.id AND blocked.state='skipped' AND blocked.reason NOT IN ('oauth_timeout','workspace_missing'))`
+	if err := tx.QueryRow(`SELECT COUNT(DISTINCT j.id), COUNT(r.ordinal)
+FROM jobs j JOIN repair_rows r ON r.job_id=j.id WHERE `+resettable).Scan(&jobs, &resetRows); err != nil {
+		rollback()
+		return 0, 0, err
+	}
+	if jobs == 0 {
+		rollback()
+		return 0, 0, errNoResettableRepairQueue
+	}
+	if _, err := tx.Exec(`UPDATE jobs SET state='superseded',reason='owner_reset',updated_at=?
+WHERE id IN (SELECT j.id FROM jobs j JOIN repair_rows r ON r.job_id=j.id WHERE `+resettable+`)`, time.Now().Unix()); err != nil {
+		rollback()
+		return 0, 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	return jobs, resetRows, nil
+}
+
 func rowReason(jobID string, ordinal int) string {
 	db, err := openStore()
 	if err != nil {
@@ -1105,10 +1164,27 @@ func runReviveQueue(runtime *reviveRuntime) {
 		}
 	}
 	if unresolvedReason != "" {
+		if autoDismissRecoverableSkippedJob(runtime.jobID) {
+			updateJob(runtime.jobID, "superseded", "auto_reset_recoverable_skips", repairedRowCount(runtime.queued))
+			return
+		}
 		updateJob(runtime.jobID, "failed", unresolvedReason, repairedRowCount(runtime.queued))
 		return
 	}
 	updateJob(runtime.jobID, "completed", "", len(runtime.queued))
+}
+
+func autoDismissRecoverableSkippedJob(jobID string) bool {
+	db, err := openStore()
+	if err != nil {
+		return false
+	}
+	var total, repaired, recoverableSkipped int
+	err = db.QueryRow(`SELECT COUNT(*),
+SUM(CASE WHEN state='repaired' THEN 1 ELSE 0 END),
+SUM(CASE WHEN state='skipped' AND reason IN ('oauth_timeout','workspace_missing') THEN 1 ELSE 0 END)
+FROM repair_rows WHERE job_id=?`, jobID).Scan(&total, &repaired, &recoverableSkipped)
+	return err == nil && total > 0 && recoverableSkipped > 0 && repaired+recoverableSkipped == total
 }
 
 // A row-level OAuth or inventory failure should not strand every later seat in

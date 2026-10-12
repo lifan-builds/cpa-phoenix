@@ -579,6 +579,7 @@ global.window={};global.setTimeout=()=>{};
  phoenixRenderJobUI({kind:'revive',state:'completed',done:3,total:3,summary:{repaired:2,skipped:1}},true);
  assert.equal(document.querySelector('#repair-summary').hidden,false);
  assert.match(document.querySelector('#repair-summary-text').textContent,/2 repaired · 1 skipped/);
+ assert.equal(phoenixRenderJob({state:'superseded',reason:'owner_reset'}),'Skipped repair history cleared.');
  phoenixActiveKind='revive';phoenixActiveJob=true;phoenixActionInFlight=true;phoenixPolledJob='job-1';phoenixSetActionAvailability(0,1,true,[]);
  assert.equal(document.querySelector('#cancel-revive').hidden,false);
  assert.equal(document.querySelector('#cancel-revive').disabled,false);
